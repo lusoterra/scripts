@@ -71,4 +71,8 @@ exec bwrap \
     --bind "$PROJECT" "$PROJECT" \
     --chdir "$PROJECT" \
     --setenv HOME "$HOME" \
+    --unsetenv DISPLAY \
+    --unsetenv WAYLAND_DISPLAY \
+    --unsetenv WAYLAND_SOCKET \
+    --unsetenv XAUTHORITY \
     opencode --standalone "$@"

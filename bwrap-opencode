@@ -37,7 +37,7 @@ for d in "$PROJECT" "${RW[@]}"; do
     [[ "$d" == "$HOME" ]] && die "refusing to expose all of \$HOME"
 done
 
-mkdir -p ~/.config/opencode ~/.local/share/opencode ~/.local/state/opencode ~/.cache/opencode
+mkdir -p ~/.config/opencode ~/.local/share/opencode ~/.local/state/opencode ~/.cache/opencode /tmp/opencode
 
 RESOLV_ARGS=()
 RESOLV="$(realpath -e /etc/resolv.conf)"
@@ -58,6 +58,8 @@ exec bwrap \
     --ro-bind /etc /etc \
     "${RESOLV_ARGS[@]}" \
     --proc /proc --dev /dev --tmpfs /tmp \
+    --dir /tmp/opencode \
+    --bind /tmp/opencode /tmp/opencode \
     --tmpfs "$HOME" \
     --bind ~/.config/zsh           ~/.config/zsh \
     --bind ~/.config/opencode      ~/.config/opencode \

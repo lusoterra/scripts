@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ocbox [-w DIR]... [-r DIR]... [PROJECT_DIR] [-- opencode args...]
+Usage: bwrap-opencode [-w DIR]... [-r DIR]... [PROJECT_DIR] [-- opencode args...]
   -w, --rw DIR   extra directory, read-write
   -r, --ro DIR   extra directory, read-only
   -h, --help     show this help
@@ -12,7 +12,7 @@ PROJECT_DIR defaults to the current directory and is always read-write.
 EOF
 }
 
-die() { echo "ocbox: $*" >&2; exit 1; }
+die() { echo "bwrap-opencode: $*" >&2; exit 1; }
 
 need_path() {
     [[ -n "${2:-}" ]] || die "$1 needs a path"
@@ -51,7 +51,7 @@ for d in "${RO[@]}"; do EXTRA+=(--ro-bind "$d" "$d"); done
 for d in "${RW[@]}"; do EXTRA+=(--bind "$d" "$d"); done
 
 exec bwrap \
-    --die-with-parent --unshare-all --share-net --hostname ocbox \
+    --die-with-parent --unshare-all --share-net --hostname bwrap-opencode \
     --ro-bind /usr /usr \
     --symlink usr/bin /bin --symlink usr/bin /sbin \
     --symlink usr/lib /lib --symlink usr/lib /lib64 \

@@ -50,6 +50,8 @@ EXTRA=()
 for d in "${RO[@]}"; do EXTRA+=(--ro-bind "$d" "$d"); done
 for d in "${RW[@]}"; do EXTRA+=(--bind "$d" "$d"); done
 
+MASK=(--ro-bind /dev/null ~/.config/git/credentials)
+
 exec bwrap \
     --die-with-parent --unshare-all --share-net --hostname bwrap-opencode \
     --ro-bind /usr /usr \
@@ -61,12 +63,13 @@ exec bwrap \
     --dir /tmp/opencode \
     --bind /tmp/opencode /tmp/opencode \
     --tmpfs "$HOME" \
-    --bind ~/.config/zsh           ~/.config/zsh \
+    --ro-bind ~/.config/zsh        ~/.config/zsh \
     --bind ~/.config/opencode      ~/.config/opencode \
     --bind ~/.local/share/opencode ~/.local/share/opencode \
     --bind ~/.local/state/opencode ~/.local/state/opencode \
     --bind ~/.cache/opencode       ~/.cache/opencode \
-    --ro-bind-try ~/.config/git ~/.config/git \
+    --ro-bind-try ~/.config/git    ~/.config/git \
+    "${MASK[@]}" \
     "${EXTRA[@]}" \
     --bind "$PROJECT" "$PROJECT" \
     --chdir "$PROJECT" \

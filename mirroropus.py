@@ -46,8 +46,42 @@ Arquivos temporários *.part nunca contam para o prune e são limpos no início.
 Por padrão o script baixa a própria prioridade (nice 10) para não atrapalhar
 outros serviços no servidor (ex.: Navidrome). Use --nice 0 para desativar.
 
+Modo --tiny (catálogo mínimo, para backup barato na nuvem):
+  - TODO arquivo de áudio (lossy ou lossless) -> .opus mono, 8 kbps por padrão
+    (tags e durações são mantidas; a qualidade é lixo de propósito)
+  - Capas embutidas -> redimensionadas para no máximo --cover-px pixels (200 por
+    padrão) em JPEG de baixa qualidade; --cover-px 0 remove as capas embutidas
+  - Imagens soltas (folder.jpg, scans, ...) -> JPEG pequeno (mesma largura máxima)
+  - Playlists (.cue/.m3u/.m3u8) e textos pequenos (.log, .nfo, .txt, ...) -> copiados
+    (as playlists são reescritas para apontar para os .opus)
+  - Qualquer outro arquivo (7z/zip de scans, PDFs, .mp4 sem áudio como as capas
+    animadas do Tidal, .sfv/.md5, ...) -> copiado como está. Se quiser um teto de
+    tamanho, use --tiny-max-copy MiB: o que passar disso deixa de ser copiado.
+  Use uma pasta de destino própria: o modo --tiny não se mistura com o normal.
+
+Lista de exceções (--keep-file ARQUIVO.txt), vale para os dois modos:
+  Um arquivo de texto com um caminho por linha, relativo à pasta ORIGEM. Tudo o que
+  casar é COPIADO INTACTO (o flac original, capa grande, tags, nome e extensão),
+  em vez de ser convertido/reduzido. Regras:
+    - linhas vazias e linhas começando com # são ignoradas;
+    - um caminho de pasta mantém tudo o que está dentro dela (subpastas incluídas);
+    - um caminho de arquivo mantém só aquele arquivo;
+    - * casa qualquer coisa (inclusive barras) e ? casa um caractere; o resto é
+      literal, então [colchetes] e (parênteses) nos nomes funcionam como estão;
+    - maiúsculas/minúsculas contam; "/" ou "\\" tanto faz.
+  Exemplo:
+      # raridades
+      Artista/[2003] Demo Tape
+      Artista/Single Raro/01 - Faixa Rara.flac
+      *Live at Some Radio Session*
+  Padrões que não casam com nada geram um aviso (erro de digitação).
+  Playlists (.cue/.m3u) continuam apontando para o .flac dos arquivos mantidos.
+
 Uso:
   ./mirroropus.py ORIGEM DESTINO
+  ./mirroropus.py ORIGEM DESTINO --tiny --keep-file raros.txt
+  ./mirroropus.py ORIGEM DESTINO --tiny
+  ./mirroropus.py ORIGEM DESTINO --tiny --cover-px 128 --prune
   ./mirroropus.py ORIGEM DESTINO -b 160 -j 8
   ./mirroropus.py ORIGEM DESTINO --overwrite
   ./mirroropus.py ORIGEM DESTINO --dry-run
@@ -66,6 +100,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -88,6 +123,11 @@ NEEDS_PROBE = {".m4a", ".mp4", ".wma", ".ogg", ".oga", ".caf", ".aifc"}
 PLAYLIST_EXTS = {".cue", ".m3u", ".m3u8"}
 
 CONVERT_ACTIONS = ("opusenc", "ffmpeg")
+# Tudo o que é recodificado (áudio + imagens do modo --tiny)
+RECODE_ACTIONS = CONVERT_ACTIONS + ("image",)
+
+# Imagens que o modo --tiny reduz para JPEG pequeno.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 
 TIMESTAMP_TOLERANCE = 2.0  # segundos (sistemas de arquivos com mtime grosseiro)
 
@@ -131,7 +171,7 @@ def _is_junk_file(name: str) -> bool:
 class Job:
     src: Path
     dst: Path
-    action: str  # "copy" | "opusenc" | "ffmpeg" | "rewrite"
+    action: str  # "copy" | "opusenc" | "ffmpeg" | "rewrite" | "image"
     rel: str
     # Só para playlists: caminhos (relativos à pasta da playlist, com "/")
     # dos arquivos que viram .opus no destino.
@@ -175,17 +215,64 @@ def classify_lossless(ext: str, codec: str) -> bool:
     return False
 
 
-def build_plan(src_root: Path, dst_root: Path, jobs_hint: int
+def _norm_path(s: str) -> str:
+    """Barras normais, sem "./" inicial, Unicode NFC (acentos iguais em qualquer FS)."""
+    s = s.strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return unicodedata.normalize("NFC", s)
+
+
+def load_keep_patterns(path: Path) -> list[tuple[str, re.Pattern]]:
+    """Lê o --keep-file: (texto original, regex) por linha útil.
+
+    Só * e ? são curingas; todo o resto é literal (colchetes de nomes de pasta
+    como "[2003] Álbum" não viram classes de caracteres).
+    """
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"Não consegui ler --keep-file {path}: {e}")
+    pats: list[tuple[str, re.Pattern]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        q = _norm_path(line).rstrip("/")
+        if not q:
+            continue
+        rx = re.compile(
+            "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in q)
+            + r"\Z", re.DOTALL)
+        pats.append((line, rx))
+    return pats
+
+
+def keep_match(rel: str, pats: list[tuple[str, re.Pattern]]) -> str | None:
+    """Devolve o padrão que mantém este arquivo (ele mesmo ou uma pasta pai)."""
+    posix = _norm_path(rel)
+    parts = posix.split("/")
+    prefixes = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    for text, rx in pats:
+        if any(rx.match(p) for p in prefixes):
+            return text
+    return None
+
+
+def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
+               tiny: bool = False, max_copy: int | None = None,
+               keep: list[tuple[str, re.Pattern]] | None = None
                ) -> tuple[list[Job], dict[str, int], list[OSError]]:
     raw: list[tuple[Path, str, str]] = []  # (src, rel, ext)
-    skipped = {"junk": 0, "symlink": 0}
+    skipped = {"junk": 0, "symlink": 0, "big": 0, "kept": 0, "kept_bytes": 0}
+    keep_hits: dict[str, int] = {text: 0 for text, _rx in (keep or [])}
     to_probe: list[Path] = []
     walk_errors: list[OSError] = []
 
     for dirpath, dirnames, filenames in os.walk(
             src_root, followlinks=False, onerror=walk_errors.append):
         # Não desce para pastas de lixo nem links simbólicos.
-        keep: list[str] = []
+        keep_dirs: list[str] = []
         for d in dirnames:
             full = Path(dirpath) / d
             if full.is_symlink():
@@ -194,8 +281,8 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int
             if _is_junk_dir(d):
                 skipped["junk"] += 1
                 continue
-            keep.append(d)
-        dirnames[:] = keep
+            keep_dirs.append(d)
+        dirnames[:] = keep_dirs
 
         for name in filenames:
             src = Path(dirpath) / name
@@ -208,7 +295,10 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int
             ext = src.suffix.lower()
             rel = str(src.relative_to(src_root))
             raw.append((src, rel, ext))
-            if ext in NEEDS_PROBE:
+            # No modo --tiny tudo passa pelo ffmpeg, então só sondamos os .mp4
+            # (podem ser capas animadas / videoclipes sem faixa de áudio).
+            if ext in NEEDS_PROBE and (not tiny or ext == ".mp4") and not (
+                    keep and keep_match(rel, keep) is not None):
                 to_probe.append(src)
 
     # ffprobe só é obrigatório se houver arquivos ambíguos.
@@ -232,7 +322,32 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int
     jobs: list[Job] = []
     for src, rel, ext in raw:
         action = "copy"
-        if ext in OPUSENC_NATIVE:
+        kept = keep_match(rel, keep) if keep else None
+        if kept is not None:
+            # Exceção da lista: copiado intacto, sem converter nem reduzir.
+            keep_hits[kept] += 1
+            skipped["kept"] += 1
+            try:
+                skipped["kept_bytes"] += src.stat().st_size
+            except OSError:
+                pass
+        elif tiny:
+            # .mp4 sem faixa de áudio (ex.: capas animadas do Tidal) não é música:
+            # cai na regra dos "outros arquivos" (copiado, salvo teto --tiny-max-copy).
+            if ext in AUDIO_EXTS and not (
+                    ext == ".mp4" and not codecs_by_path.get(src)):
+                action = "ffmpeg"
+            elif ext in IMAGE_EXTS:
+                action = "image"
+            elif max_copy is not None and ext not in PLAYLIST_EXTS:
+                try:
+                    size = src.stat().st_size
+                except OSError:
+                    size = 0
+                if size > max_copy:
+                    skipped["big"] += 1
+                    continue
+        elif ext in OPUSENC_NATIVE:
             action = "opusenc"
         elif ext in VIA_FFMPEG:
             action = "ffmpeg"
@@ -247,7 +362,14 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int
         dst = dst_root / rel
         if action in CONVERT_ACTIONS:
             dst = dst.with_suffix(".opus")
+        elif action == "image":
+            dst = dst.with_suffix(".jpg")
         jobs.append(Job(src, dst, action, rel))
+
+    for text, hits in keep_hits.items():
+        if hits == 0:
+            print(f"AVISO: --keep-file: o padrão não casou com nada: {text}",
+                  file=sys.stderr, flush=True)
 
     # Se dois arquivos colidirem no mesmo destino (ex.: faixa.flac e faixa.opus),
     # ganha a cópia direta; os restantes são avisados e ignorados.
@@ -373,7 +495,7 @@ def up_to_date(job: Job) -> bool:
 def is_current(job: Job, args: argparse.Namespace) -> bool:
     if args.overwrite:
         return False
-    if args.redo_converted and job.action in CONVERT_ACTIONS:
+    if args.redo_converted and job.action in RECODE_ACTIONS:
         return False
     return up_to_date(job)
 
@@ -394,10 +516,10 @@ def load_state(dst_root: Path) -> dict:
         return {}
 
 
-def save_state(dst_root: Path, bitrate: int) -> None:
+def save_state(dst_root: Path, data: dict) -> None:
     try:
         state_path(dst_root).write_text(
-            json.dumps({"bitrate": bitrate}) + "\n", encoding="utf-8")
+            json.dumps(data) + "\n", encoding="utf-8")
     except OSError as e:
         print(f"AVISO: não consegui gravar o estado do bitrate "
               f"({state_path(dst_root)}): {e}", file=sys.stderr, flush=True)
@@ -512,6 +634,56 @@ def encode_ffmpeg(src: Path, tmp: Path, bitrate: int) -> tuple[bool, str]:
     return ok2, msg2 if not ok2 else ""
 
 
+def encode_tiny(src: Path, tmp: Path, bitrate: int, cover_px: int) -> tuple[bool, str]:
+    """Qualquer áudio -> Opus mono minúsculo, com tags e capa reduzida.
+
+    O ffmpeg decodifica, faz downmix para mono e entrega FLAC em pipe (com tags e
+    a capa já redimensionada) ao opusenc, que grava as tags e a capa no .opus.
+    """
+    base = [
+        "ffmpeg", "-nostdin", "-v", "error", "-i", str(src),
+        "-map", "0:a:0", "-map_metadata", "0",
+    ]
+    audio = ["-ac", "1", "-c:a", "flac", "-compression_level", "0",
+             "-f", "flac", "pipe:1"]
+    # framesize 60 ms: menos overhead de cabeçalhos a bitrates tão baixos
+    enc_cmd = ["opusenc", "--quiet", "--bitrate", str(bitrate),
+               "--framesize", "60", "-", str(tmp)]
+
+    if cover_px > 0:
+        cover = [
+            "-map", "0:v:0?", "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "12",
+            # só 1 frame: num .mp4 de videoclipe o "vídeo" não é uma capa
+            "-frames:v", "1",
+            "-vf", f"scale='min({cover_px},iw)':-2",
+            "-disposition:v:0", "attached_pic",
+        ]
+        ok, _msg = _run_pipeline(base + cover + audio, enc_cmd)
+        if ok:
+            return True, ""
+        tmp.unlink(missing_ok=True)
+    # sem capa (cover_px == 0, ou a capa deu problema)
+    ok2, msg2 = _run_pipeline(base + audio, enc_cmd)
+    return ok2, msg2 if not ok2 else ""
+
+
+def encode_image(src: Path, tmp: Path, max_px: int) -> tuple[bool, str]:
+    """Imagem -> JPEG pequeno (largura máxima max_px, qualidade baixa)."""
+    px = max_px if max_px > 0 else 200
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-v", "error", "-i", str(src),
+                "-frames:v", "1", "-vf", f"scale='min({px},iw)':-2",
+                "-pix_fmt", "yuvj420p", "-q:v", "12", "-f", "mjpeg", "-y", str(tmp),
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    return r.returncode == 0, r.stderr.strip()
+
+
 # --------------------------------------------------------------------------
 # Worker
 # --------------------------------------------------------------------------
@@ -534,14 +706,19 @@ def run_job(job: Job, args: argparse.Namespace) -> tuple[str, str]:
             st = job.src.stat()
             os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         else:
-            encoder = encode_opusenc if job.action == "opusenc" else encode_ffmpeg
-            ok, err = encoder(job.src, tmp, args.bitrate)
-            if (not ok or not tmp.exists() or tmp.stat().st_size == 0) \
-                    and job.action == "opusenc":
-                # Fallback: WAV/AIFF exóticos que o opusenc não lê
-                # (ex.: WAV com MP3 dentro) tentam via ffmpeg.
-                tmp.unlink(missing_ok=True)
-                ok, err = encode_ffmpeg(job.src, tmp, args.bitrate)
+            if job.action == "image":
+                ok, err = encode_image(job.src, tmp, args.cover_px)
+            elif args.tiny:
+                ok, err = encode_tiny(job.src, tmp, args.bitrate, args.cover_px)
+            else:
+                encoder = encode_opusenc if job.action == "opusenc" else encode_ffmpeg
+                ok, err = encoder(job.src, tmp, args.bitrate)
+                if (not ok or not tmp.exists() or tmp.stat().st_size == 0) \
+                        and job.action == "opusenc":
+                    # Fallback: WAV/AIFF exóticos que o opusenc não lê
+                    # (ex.: WAV com MP3 dentro) tentam via ffmpeg.
+                    tmp.unlink(missing_ok=True)
+                    ok, err = encode_ffmpeg(job.src, tmp, args.bitrate)
             if not ok or not tmp.exists() or tmp.stat().st_size == 0:
                 raise RuntimeError(err or "falha desconhecida")
             st = job.src.stat()
@@ -592,8 +769,22 @@ def main() -> int:
     )
     ap.add_argument("source", type=Path, help="pasta da biblioteca master")
     ap.add_argument("dest", type=Path, help="pasta de destino")
-    ap.add_argument("-b", "--bitrate", type=int, default=128,
-                    help="bitrate Opus em kbps (por padrão: 128)")
+    ap.add_argument("-b", "--bitrate", type=int, default=None,
+                    help="bitrate Opus em kbps (por padrão: 128; 8 com --tiny)")
+    ap.add_argument("--tiny", action="store_true",
+                    help="catálogo mínimo: TODO áudio vira Opus mono de baixíssima "
+                         "qualidade (8 kbps), capas e imagens ficam minúsculas, "
+                         "o resto (7z, logs, ...) é copiado como está")
+    ap.add_argument("--cover-px", type=int, default=200, metavar="N",
+                    help="com --tiny: largura máxima das capas/imagens em pixels "
+                         "(por padrão: 200; 0 remove as capas embutidas)")
+    ap.add_argument("--tiny-max-copy", type=float, default=None, metavar="MiB",
+                    help="com --tiny: teto opcional, em MiB, para os outros arquivos "
+                         "(7z, pdf, ...): os maiores não são copiados (por padrão: "
+                         "sem teto, tudo é copiado)")
+    ap.add_argument("--keep-file", type=Path, default=None, metavar="ARQUIVO",
+                    help="arquivo de texto com caminhos (relativos à origem) que são "
+                         "copiados intactos, sem converter (raridades em flac, ...)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="conversões em paralelo (por padrão: nº de CPUs)")
     ap.add_argument("--nice", type=int, default=10, metavar="N",
@@ -610,8 +801,14 @@ def main() -> int:
                     help="com --prune: máximo de álbuns afetados sem -y (por padrão: 3)")
     args = ap.parse_args()
 
+    if args.bitrate is None:
+        args.bitrate = 8 if args.tiny else 128
     if not 6 <= args.bitrate <= 512:
         sys.exit("Bitrate inválido: use 6-512 kbps.")
+    if args.cover_px < 0:
+        sys.exit("--cover-px tem que ser >= 0.")
+    if args.tiny_max_copy is not None and args.tiny_max_copy < 0:
+        sys.exit("--tiny-max-copy tem que ser >= 0.")
     if args.jobs < 1:
         sys.exit("--jobs tem que ser >= 1.")
     if not 0 <= args.nice <= 19:
@@ -633,30 +830,54 @@ def main() -> int:
         except OSError:
             pass
 
-    jobs, skipped, walk_errors = build_plan(src_root, dst_root, args.jobs)
+    prev_state = load_state(dst_root)
+    if prev_state and bool(prev_state.get("tiny", False)) != args.tiny:
+        was = "--tiny" if prev_state.get("tiny") else "normal"
+        sys.exit(f"Este destino já foi usado no modo {was} e os dois modos não se "
+                 f"misturam. Use outra pasta de destino.")
+
+    max_copy = (None if args.tiny_max_copy is None
+                else int(args.tiny_max_copy * 1024 * 1024))
+    keep = load_keep_patterns(args.keep_file) if args.keep_file else None
+    jobs, skipped, walk_errors = build_plan(
+        src_root, dst_root, args.jobs, tiny=args.tiny, max_copy=max_copy, keep=keep)
 
     if any(j.action in CONVERT_ACTIONS for j in jobs) and shutil.which("opusenc") is None:
         sys.exit("opusenc não encontrado (instala o pacote opus-tools).")
-    if any(j.action == "ffmpeg" for j in jobs) and shutil.which("ffmpeg") is None:
-        sys.exit("ffmpeg é necessário para ALAC/APE/WV/TTA/TAK/SHN/DSD/WMA-lossless "
-                 "mas não foi encontrado.")
+    if any(j.action in ("ffmpeg", "image") for j in jobs) and shutil.which("ffmpeg") is None:
+        sys.exit("ffmpeg é necessário (ALAC/APE/WV/TTA/TAK/SHN/DSD/WMA-lossless, "
+                 "modo --tiny, ...) mas não foi encontrado.")
 
-    # Bitrate mudou desde a última execução completa? Então refaz só os convertidos.
-    prev_bitrate = load_state(dst_root).get("bitrate")
+    # Configuração mudou desde a última execução completa? Então refaz só os
+    # arquivos recodificados (as cópias diretas não são tocadas).
+    prev_bitrate = prev_state.get("bitrate")
+    prev_cover = prev_state.get("cover_px")
     bitrate_changed = isinstance(prev_bitrate, int) and prev_bitrate != args.bitrate
-    args.redo_converted = bitrate_changed and not args.overwrite
+    cover_changed = (args.tiny and isinstance(prev_cover, int)
+                     and prev_cover != args.cover_px)
+    settings_changed = bitrate_changed or cover_changed
+    args.redo_converted = settings_changed and not args.overwrite
 
     total = len(jobs)
-    n_convert = sum(1 for j in jobs if j.action in CONVERT_ACTIONS)
+    n_convert = sum(1 for j in jobs if j.action in RECODE_ACTIONS)
     print(f"{total} arquivos na origem ({n_convert} a converter). "
-          f"Bitrate: {args.bitrate} kbps. "
-          f"Modo: {'overwrite' if args.overwrite else 'incremental'}.", flush=True)
+          f"Bitrate: {args.bitrate} kbps"
+          + (f", mono, capas até {args.cover_px}px. " if args.tiny else ". ")
+          + f"Modo: {'overwrite' if args.overwrite else 'incremental'}"
+          + (" + tiny." if args.tiny else "."), flush=True)
     if skipped["junk"] or skipped["symlink"]:
         print(f"Ignorados: {skipped['junk']} de lixo, "
               f"{skipped['symlink']} links simbólicos.", flush=True)
+    if skipped["big"]:
+        print(f"Ignorados (--tiny): {skipped['big']} arquivo(s) que não são áudio/"
+              f"imagem e passam de {args.tiny_max_copy:g} MiB (não serão copiados).",
+              flush=True)
+    if skipped["kept"]:
+        print(f"Mantidos intactos (--keep-file): {skipped['kept']} arquivo(s), "
+              f"{human_size(skipped['kept_bytes'])}.", flush=True)
     if args.redo_converted:
-        print(f"Bitrate mudou ({prev_bitrate} -> {args.bitrate} kbps): "
-              f"os arquivos convertidos serão refeitos.", flush=True)
+        print("Configuração mudou (bitrate/capas): "
+              "os arquivos convertidos serão refeitos.", flush=True)
     if walk_errors:
         print(f"AVISO: {len(walk_errors)} pasta(s) da origem não puderam ser lidas "
               f"(os arquivos delas NÃO foram espelhados):", file=sys.stderr, flush=True)
@@ -713,7 +934,7 @@ def main() -> int:
             if is_current(j, args):
                 counts["skipped"] += 1
                 continue
-            if j.action in CONVERT_ACTIONS:
+            if j.action in RECODE_ACTIONS:
                 counts["convert"] += 1
                 print(f"[converter] {j.rel}")
             elif j.action == "rewrite":
@@ -790,10 +1011,13 @@ def main() -> int:
 
     # Só grava o bitrate novo se nada falhou: um arquivo que falhou continua com o
     # bitrate antigo e, sem isto, seria considerado atualizado para sempre.
-    if not (bitrate_changed and failures):
-        save_state(dst_root, args.bitrate)
+    if not (settings_changed and failures):
+        state = {"bitrate": args.bitrate, "tiny": args.tiny}
+        if args.tiny:
+            state["cover_px"] = args.cover_px
+        save_state(dst_root, state)
     elif failures:
-        print("O bitrate novo NÃO foi gravado no estado porque houve falhas; "
+        print("A nova configuração NÃO foi gravada no estado porque houve falhas; "
               "a próxima execução refaz os convertidos de novo.",
               file=sys.stderr, flush=True)
 

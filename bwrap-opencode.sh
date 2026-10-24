@@ -37,7 +37,7 @@ for d in "$PROJECT" "${RW[@]}"; do
     [[ "$d" == "$HOME" ]] && die "refusing to expose all of \$HOME"
 done
 
-mkdir -p ~/.config/opencode ~/.local/share/opencode ~/.local/state/opencode ~/.cache/opencode /tmp/opencode
+mkdir -p "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.local/state/opencode" "$HOME/.cache/opencode" /tmp/opencode
 
 RESOLV_ARGS=()
 RESOLV="$(realpath -e /etc/resolv.conf)"
@@ -63,17 +63,22 @@ exec bwrap \
     --dir /tmp/opencode \
     --bind /tmp/opencode /tmp/opencode \
     --tmpfs "$HOME" \
-    --ro-bind ~/.config/zsh        ~/.config/zsh \
-    --bind ~/.config/opencode      ~/.config/opencode \
-    --bind ~/.local/share/opencode ~/.local/share/opencode \
-    --bind ~/.local/state/opencode ~/.local/state/opencode \
-    --bind ~/.cache/opencode       ~/.cache/opencode \
-    --ro-bind-try ~/.config/git    ~/.config/git \
+    --ro-bind "$HOME/.config/zsh"        "$HOME/.config/zsh" \
+    --bind "$HOME/.config/opencode"      "$HOME/.config/opencode" \
+    --bind "$HOME/.local/share/opencode" "$HOME/.local/share/opencode" \
+    --bind "$HOME/.local/state/opencode" "$HOME/.local/state/opencode" \
+    --bind "$HOME/.cache/opencode"       "$HOME/.cache/opencode" \
+    --ro-bind-try "$HOME/.config/git"    "$HOME/.config/git" \
     "${MASK[@]}" \
     "${EXTRA[@]}" \
     --bind "$PROJECT" "$PROJECT" \
     --chdir "$PROJECT" \
     --setenv HOME "$HOME" \
+    --bind-try "$HOME/.cache/npm" "$HOME/.cache/npm" \
+    --bind-try "$HOME/.local/share/npm" "$HOME/.local/share/npm" \
+    --bind-try "$HOME/.config/npm" "$HOME/.config/npm" \
+    --bind-try "$HOME/.local/bin" "$HOME/.local/bin" \
+    --setenv npm_config_cache "$HOME/.cache/npm" \
     --unsetenv DISPLAY \
     --unsetenv WAYLAND_DISPLAY \
     --unsetenv WAYLAND_SOCKET \

@@ -146,6 +146,10 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 
 TIMESTAMP_TOLERANCE = 2.0  # seconds (filesystems with coarse mtime)
 
+# Bumped when the encoder output changes: converted files of an older mirror are
+# redone once (v2 repairs the --tiny outputs whose audio was cut to ~1 second).
+ENC_VERSION = 2
+
 # Extensions considered "music" (to count albums and validate the source).
 # Includes lossy + lossless + ambiguous containers.
 AUDIO_EXTS = {
@@ -720,9 +724,11 @@ def encode_tiny(src: Path, tmp: Path, bitrate: int, cover_px: int) -> tuple[bool
     if cover_px > 0:
         cover = [
             "-map", "0:v:0?", "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "12",
-            # only 1 frame: in a music-video .mp4 the "video" is not a cover
-            "-frames:v", "1",
-            "-vf", f"scale='min({cover_px},iw)':-2",
+            # only 1 frame: in a music-video .mp4 the "video" is not a cover.
+            # A select filter, NOT -frames:v 1: that one ends the whole output
+            # after the 1st video frame and cuts the audio down to ~1 second
+            # (both processes still exit 0, so the truncation went unnoticed).
+            "-vf", f"select='eq(n,0)',scale='min({cover_px},iw)':-2",
             "-disposition:v:0", "attached_pic",
         ]
         ok, _msg = _run_pipeline(base + cover + audio, enc_cmd)
@@ -932,7 +938,11 @@ def main() -> int:
     bitrate_changed = isinstance(prev_bitrate, int) and prev_bitrate != args.bitrate
     cover_changed = (args.tiny and isinstance(prev_cover, int)
                      and prev_cover != args.cover_px)
-    settings_changed = bitrate_changed or cover_changed
+    # Older encoder output (e.g. the --tiny files whose audio was cut short when
+    # a cover was embedded): redone once, like a settings change.
+    enc_changed = (bool(prev_state) and args.tiny
+                   and prev_state.get("enc_version", 1) < ENC_VERSION)
+    settings_changed = bitrate_changed or cover_changed or enc_changed
     args.redo_converted = settings_changed and not args.overwrite
 
     total = len(jobs)
@@ -955,7 +965,10 @@ def main() -> int:
         print(f"Kept intact (--keep-album): {skipped['kept']} file(s), "
               f"{human_size(skipped['kept_bytes'])}.", flush=True)
     if args.redo_converted:
-        print("Settings changed (bitrate/covers): "
+        why = [w for w, changed in (("bitrate", bitrate_changed),
+                                    ("covers", cover_changed),
+                                    ("encoder fix", enc_changed)) if changed]
+        print(f"Settings changed ({'/'.join(why)}): "
               "the converted files will be redone.", flush=True)
     if walk_errors:
         print(f"WARNING: {len(walk_errors)} source folder(s) could not be read "
@@ -1088,7 +1101,8 @@ def main() -> int:
     # Only save the new bitrate if nothing failed: a file that failed keeps the
     # old bitrate and, without this, would count as up to date forever.
     if not (settings_changed and failures):
-        state = {"bitrate": args.bitrate, "tiny": args.tiny}
+        state = {"bitrate": args.bitrate, "tiny": args.tiny,
+                 "enc_version": ENC_VERSION}
         if args.tiny:
             state["cover_px"] = args.cover_px
         save_state(dst_root, state)

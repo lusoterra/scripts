@@ -2,93 +2,93 @@
 """
 mirroropus.py
 
-Espelha uma biblioteca de música (master) para uma cópia "leve" em Opus,
-mantendo a estrutura de pastas.
+Mirrors a music library (master) to a lightweight Opus copy,
+keeping the folder structure.
 
-  - Lossy (MP3, Opus, Ogg Vorbis, AAC, WMA lossy, Musepack, ...) -> copiado como está
+  - Lossy (MP3, Opus, Ogg Vorbis, AAC, WMA lossy, Musepack, ...) -> copied as-is
   - Lossless (FLAC, WAV, AIFF, ALAC, APE, WV, TTA, TAK, SHN, WMA lossless,
-    Ogg-FLAC, DSD (.dsf/.dff), CAF/AIFC lossless, ...)           -> convertido para .opus
-  - Playlists (.cue, .m3u, .m3u8)                                -> copiadas e reescritas
-    para apontar para os .opus (ex.: FILE "faixa.flac" passa a FILE "faixa.opus"),
-    mantendo a codificação e as quebras de linha originais
-  - Tudo o resto                                                -> copiado como está:
-    accurip (.accurip), .log, .nfo, .txt, .lrc, capas (.jpg/.png),
-    scans e booklets (ex.: [album]/scans/, .7z/.zip/.rar/.pdf com scans),
-    e qualquer outro arquivo ou subpasta. A estrutura é mantida igual à origem.
+    Ogg-FLAC, DSD (.dsf/.dff), CAF/AIFC lossless, ...)           -> converted to .opus
+  - Playlists (.cue, .m3u, .m3u8)                                -> copied and rewritten
+    to point at the .opus files (e.g. FILE "track.flac" becomes FILE "track.opus"),
+    keeping the original encoding and line endings
+  - Everything else                                              -> copied as-is:
+    accurip (.accurip), .log, .nfo, .txt, .lrc, covers (.jpg/.png),
+    scans and booklets (e.g. [album]/scans/, .7z/.zip/.rar/.pdf with scans),
+    and any other file or subfolder. The structure is kept identical to the source.
 
-Encoder: opusenc (opus-tools). Copia tags e capas embutidas de FLAC.
-Formatos que o opusenc não lê passam primeiro pelo ffmpeg, que decodifica
-para FLAC em pipe (com tags e capa), e esse pipe é lido pelo opusenc.
+Encoder: opusenc (opus-tools). Copies tags and embedded covers from FLAC.
+Formats opusenc cannot read go first through ffmpeg, which decodes
+to FLAC on a pipe (with tags and cover), and that pipe is read by opusenc.
 
-Modo incremental (por padrão): só processa o que é novo ou mudou na
-origem (mtime diferente do destino, ou tamanho diferente nas cópias diretas).
-O bitrate usado fica guardado num arquivo de estado ao lado da pasta de destino
-(.NOME.mirroropus.json). Se você mudar -b, só os arquivos convertidos são
-refeitos; as cópias diretas não são tocadas. --overwrite refaz tudo.
+Incremental mode (default): only processes what is new or changed in the
+source (different mtime at the destination, or different size on direct copies).
+The bitrate used is kept in a state file next to the destination folder
+(.NAME.mirroropus.json). If you change -b, only the converted files are
+redone; direct copies are left untouched. --overwrite redoes everything.
 
-Sempre ignorados (lixo): dotfiles/pastas com ponto (.DS_Store, ._*, .Trash-1000,
+Always ignored (junk): dotfiles/dot-folders (.DS_Store, ._*, .Trash-1000,
 .Trashes, .Spotlight-V100, ...), @eaDir, .AppleDouble, Thumbs.db, desktop.ini,
-$RECYCLE.BIN, "System Volume Information", etc. Exceção: .ndignore (Navidrome)
-é copiado. Symlinks são sempre ignorados e nunca seguidos.
+$RECYCLE.BIN, "System Volume Information", etc. Exception: .ndignore (Navidrome)
+is copied. Symlinks are always ignored and never followed.
 
---prune apaga do destino tudo o que já não tem correspondente na origem
-(arquivos removidos/renomeados na master). Apaga na hora, mas:
-  - sempre avisa quantos arquivos e álbuns serão apagados;
-  - não roda sem -y/--yes se forem afetados mais álbuns do que
-    --prune-limit (por padrão 3);
-  - nunca roda se a origem não tiver nenhum arquivo de áudio
-    (disco desmontado, caminho errado, ...);
-  - nunca roda se alguma pasta da origem não pôde ser lida (permissões, erro de I/O),
-    porque os arquivos dela pareceriam "removidos".
-Com --dry-run, só lista o que seria apagado.
-Arquivos temporários *.part nunca contam para o prune e são limpos no início.
+--prune deletes from the destination everything that no longer has a match in the source
+(files removed/renamed in the master). It deletes right away, but:
+  - always reports how many files and albums will be deleted;
+  - does not run without -y/--yes if more albums than
+    --prune-limit are affected (default 3);
+  - never runs if the source has no audio files
+    (unmounted disk, wrong path, ...);
+  - never runs if some source folder could not be read (permissions, I/O error),
+    because its files would look "removed".
+With --dry-run, it only lists what would be deleted.
+Temporary *.part files never count for the prune and are cleaned up at startup.
 
-Por padrão o script baixa a própria prioridade (nice 10) para não atrapalhar
-outros serviços no servidor (ex.: Navidrome). Use --nice 0 para desativar.
+By default the script lowers its own priority (nice 10) so it does not get in
+the way of other services on the server (e.g. Navidrome). Use --nice 0 to disable.
 
-Modo --tiny (catálogo mínimo, para backup barato na nuvem):
-  - TODO arquivo de áudio (lossy ou lossless) -> .opus mono, 8 kbps por padrão
-    (tags e durações são mantidas; a qualidade é lixo de propósito)
-  - Capas embutidas -> redimensionadas para no máximo --cover-px pixels (200 por
-    padrão) em JPEG de baixa qualidade; --cover-px 0 remove as capas embutidas
-  - Imagens soltas (folder.jpg, scans, ...) -> JPEG pequeno (mesma largura máxima)
-  - Playlists (.cue/.m3u/.m3u8) e textos pequenos (.log, .nfo, .txt, ...) -> copiados
-    (as playlists são reescritas para apontar para os .opus)
-  - Qualquer outro arquivo (7z/zip de scans, PDFs, .mp4 sem áudio como as capas
-    animadas do Tidal, .sfv/.md5, ...) -> copiado como está. Se quiser um teto de
-    tamanho, use --tiny-max-copy MiB: o que passar disso deixa de ser copiado.
-  Use uma pasta de destino própria: o modo --tiny não se mistura com o normal.
+--tiny mode (minimal catalogue, for cheap cloud backup):
+  - EVERY audio file (lossy or lossless) -> mono .opus, 8 kbps by default
+    (tags and durations are kept; the quality is garbage on purpose)
+  - Embedded covers -> resized to at most --cover-px pixels (200 by
+    default) as low-quality JPEG; --cover-px 0 strips the embedded covers
+  - Loose images (folder.jpg, scans, ...) -> small JPEG (same maximum width)
+  - Playlists (.cue/.m3u/.m3u8) and small texts (.log, .nfo, .txt, ...) -> copied
+    (playlists are rewritten to point at the .opus files)
+  - Any other file (7z/zip of scans, PDFs, .mp4 without audio such as Tidal's
+    animated covers, .sfv/.md5, ...) -> copied as-is. If you want a size
+    ceiling, use --tiny-max-copy MiB: anything above it stops being copied.
+  Use a dedicated destination folder: --tiny mode does not mix with the normal one.
 
-Lista de exceções (--keep-file ARQUIVO.txt), vale para os dois modos:
-  Um arquivo de texto com um caminho por linha, relativo à pasta ORIGEM. Tudo o que
-  casar é COPIADO INTACTO (o flac original, capa grande, tags, nome e extensão),
-  em vez de ser convertido/reduzido. Regras:
-    - linhas vazias e linhas começando com # são ignoradas;
-    - um caminho de pasta mantém tudo o que está dentro dela (subpastas incluídas);
-    - um caminho de arquivo mantém só aquele arquivo;
-    - * casa qualquer coisa (inclusive barras) e ? casa um caractere; o resto é
-      literal, então [colchetes] e (parênteses) nos nomes funcionam como estão;
-    - maiúsculas/minúsculas contam; "/" ou "\\" tanto faz.
-  Exemplo:
-      # raridades
-      Artista/[2003] Demo Tape
-      Artista/Single Raro/01 - Faixa Rara.flac
+Exception list (--keep-file FILE.txt), applies to both modes:
+  A text file with one path per line, relative to the SOURCE folder. Everything that
+  matches is COPIED INTACT (the original flac, big cover, tags, name and extension)
+  instead of being converted/downsized. Rules:
+    - blank lines and lines starting with # are ignored;
+    - a folder path keeps everything inside it (subfolders included);
+    - a file path keeps only that file;
+    - * matches anything (including slashes) and ? matches a single character; everything
+      else is literal, so [brackets] and (parentheses) in names work as-is;
+    - case matters; "/" or "\\" are equivalent.
+  Example:
+      # rarities
+      Artist/[2003] Demo Tape
+      Artist/Rare Single/01 - Rare Track.flac
       *Live at Some Radio Session*
-  Padrões que não casam com nada geram um aviso (erro de digitação).
-  Playlists (.cue/.m3u) continuam apontando para o .flac dos arquivos mantidos.
+  Patterns that match nothing produce a warning (typo).
+  Playlists (.cue/.m3u) keep pointing at the .flac of kept files.
 
-Uso:
-  ./mirroropus.py ORIGEM DESTINO
-  ./mirroropus.py ORIGEM DESTINO --tiny --keep-file raros.txt
-  ./mirroropus.py ORIGEM DESTINO --tiny
-  ./mirroropus.py ORIGEM DESTINO --tiny --cover-px 128 --prune
-  ./mirroropus.py ORIGEM DESTINO -b 160 -j 8
-  ./mirroropus.py ORIGEM DESTINO --overwrite
-  ./mirroropus.py ORIGEM DESTINO --dry-run
-  ./mirroropus.py ORIGEM DESTINO --prune
-  ./mirroropus.py ORIGEM DESTINO --prune -y --prune-limit 20
+Usage:
+  ./mirroropus.py SOURCE DEST
+  ./mirroropus.py SOURCE DEST --tiny --keep-file rarities.txt
+  ./mirroropus.py SOURCE DEST --tiny
+  ./mirroropus.py SOURCE DEST --tiny --cover-px 128 --prune
+  ./mirroropus.py SOURCE DEST -b 160 -j 8
+  ./mirroropus.py SOURCE DEST --overwrite
+  ./mirroropus.py SOURCE DEST --dry-run
+  ./mirroropus.py SOURCE DEST --prune
+  ./mirroropus.py SOURCE DEST --prune -y --prune-limit 20
 
-Requisitos: opusenc; ffmpeg + ffprobe (para ALAC/APE/WV/TTA/TAK/SHN/DSD/WMA-lossless/Ogg-FLAC/.m4a/.caf).
+Requirements: opusenc; ffmpeg + ffprobe (for ALAC/APE/WV/TTA/TAK/SHN/DSD/WMA-lossless/Ogg-FLAC/.m4a/.caf).
 """
 from __future__ import annotations
 
@@ -106,33 +106,33 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-# Lidos diretamente pelo opusenc (PCM/AIFF/FLAC simples)
+# Read directly by opusenc (PCM/AIFF/simple FLAC)
 OPUSENC_NATIVE = {".flac", ".wav", ".aif", ".aiff"}
-# Lossless que passam sempre pelo ffmpeg (opusenc não lê)
+# Lossless that always go through ffmpeg (opusenc cannot read them)
 VIA_FFMPEG = {
     ".ape", ".wv", ".tta", ".tak", ".shn",
     ".dsf", ".dff", ".dsd",
 }
-# Contentores ambíguos: só convertem se o codec real for lossless (ver probe_codec)
-# .m4a/.mp4: alac -> converte, aac -> copia
-# .wma: wmalossless -> converte, resto (wmav1/wmav2/wmapro/wmavoice) -> copia
-# .ogg/.oga: flac -> converte, resto (vorbis/opus/...) -> copia
-# .caf/.aifc: alac/pcm/flac -> converte, resto (aac/mp3/...) -> copia
+# Ambiguous containers: only converted if the actual codec is lossless (see probe_codec)
+# .m4a/.mp4: alac -> convert, aac -> copy
+# .wma: wmalossless -> convert, the rest (wmav1/wmav2/wmapro/wmavoice) -> copy
+# .ogg/.oga: flac -> convert, the rest (vorbis/opus/...) -> copy
+# .caf/.aifc: alac/pcm/flac -> convert, the rest (aac/mp3/...) -> copy
 NEEDS_PROBE = {".m4a", ".mp4", ".wma", ".ogg", ".oga", ".caf", ".aifc"}
-# Playlists com referências a arquivos de áudio (reescritas no destino)
+# Playlists with references to audio files (rewritten at the destination)
 PLAYLIST_EXTS = {".cue", ".m3u", ".m3u8"}
 
 CONVERT_ACTIONS = ("opusenc", "ffmpeg")
-# Tudo o que é recodificado (áudio + imagens do modo --tiny)
+# Everything that is re-encoded (audio + images in --tiny mode)
 RECODE_ACTIONS = CONVERT_ACTIONS + ("image",)
 
-# Imagens que o modo --tiny reduz para JPEG pequeno.
+# Images that --tiny mode downsizes to a small JPEG.
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 
-TIMESTAMP_TOLERANCE = 2.0  # segundos (sistemas de arquivos com mtime grosseiro)
+TIMESTAMP_TOLERANCE = 2.0  # seconds (filesystems with coarse mtime)
 
-# Extensões consideradas "música" (para contar álbuns e validar a origem).
-# Inclui lossy + lossless + contentores ambíguos.
+# Extensions considered "music" (to count albums and validate the source).
+# Includes lossy + lossless + ambiguous containers.
 AUDIO_EXTS = {
     ".opus", ".mp3", ".m4a", ".mp4", ".aac", ".ogg", ".oga", ".wma",
     ".flac", ".wav", ".aif", ".aiff", ".aifc", ".caf",
@@ -140,7 +140,7 @@ AUDIO_EXTS = {
     ".dsf", ".dff", ".dsd",
 }
 
-# Pastas de lixo que nunca são percorridas nem espelhadas.
+# Junk folders that are never traversed nor mirrored.
 IGNORE_DIRS = {
     "@eadir", ".appledouble",
     "$recycle.bin", "system volume information",
@@ -148,11 +148,11 @@ IGNORE_DIRS = {
     ".documentrevisions-v100", ".pk installsandboxmanager",
     "found.000",
 }
-# Arquivos de lixo que nunca são espelhados.
+# Junk files that are never mirrored.
 IGNORE_FILES = {
     ".ds_store", "thumbs.db", "desktop.ini", ".apdisk",
 }
-# Dotfiles que têm significado para o servidor de música e DEVEM ser copiados.
+# Dotfiles that are meaningful for the music server and MUST be copied.
 KEEP_DOTFILES = {".ndignore"}
 
 
@@ -164,7 +164,7 @@ def _is_junk_file(name: str) -> bool:
     n = name.lower()
     if n in KEEP_DOTFILES:
         return False
-    return name.startswith(".") or n in IGNORE_FILES  # inclui ._* (AppleDouble)
+    return name.startswith(".") or n in IGNORE_FILES  # includes ._* (AppleDouble)
 
 
 @dataclass
@@ -173,16 +173,16 @@ class Job:
     dst: Path
     action: str  # "copy" | "opusenc" | "ffmpeg" | "rewrite" | "image"
     rel: str
-    # Só para playlists: caminhos (relativos à pasta da playlist, com "/")
-    # dos arquivos que viram .opus no destino.
+    # Playlists only: paths (relative to the playlist's folder, with "/")
+    # of the files that become .opus at the destination.
     convert_set: set[str] | None = None
 
 
 # --------------------------------------------------------------------------
-# Planeamento
+# Planning
 # --------------------------------------------------------------------------
 def probe_codec(path: Path) -> str:
-    """Retorna o codec do 1.º stream de áudio (minúsculas) ou "" se falhar."""
+    """Returns the codec of the 1st audio stream (lowercase) or "" on failure."""
     try:
         r = subprocess.run(
             [
@@ -193,17 +193,17 @@ def probe_codec(path: Path) -> str:
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as e:
-        print(f"AVISO: ffprobe falhou em {path}: {e}", file=sys.stderr, flush=True)
+        print(f"WARNING: ffprobe failed on {path}: {e}", file=sys.stderr, flush=True)
         return ""
     if r.returncode != 0:
-        print(f"AVISO: ffprobe não conseguiu ler {path}: "
+        print(f"WARNING: ffprobe could not read {path}: "
               f"{r.stderr.strip()[:200]}", file=sys.stderr, flush=True)
         return ""
     return r.stdout.strip().split(",")[0].strip().lower()
 
 
 def classify_lossless(ext: str, codec: str) -> bool:
-    """Diz se uma extensão ambígua deve ser convertida (codec lossless)."""
+    """Says whether an ambiguous extension should be converted (lossless codec)."""
     if ext in (".m4a", ".mp4"):
         return codec == "alac"
     if ext == ".wma":
@@ -216,7 +216,7 @@ def classify_lossless(ext: str, codec: str) -> bool:
 
 
 def _norm_path(s: str) -> str:
-    """Barras normais, sem "./" inicial, Unicode NFC (acentos iguais em qualquer FS)."""
+    """Forward slashes, no leading "./", Unicode NFC (accents match on any FS)."""
     s = s.strip().replace("\\", "/")
     while s.startswith("./"):
         s = s[2:]
@@ -224,15 +224,15 @@ def _norm_path(s: str) -> str:
 
 
 def load_keep_patterns(path: Path) -> list[tuple[str, re.Pattern]]:
-    """Lê o --keep-file: (texto original, regex) por linha útil.
+    """Reads the --keep-file: (original text, regex) per useful line.
 
-    Só * e ? são curingas; todo o resto é literal (colchetes de nomes de pasta
-    como "[2003] Álbum" não viram classes de caracteres).
+    Only * and ? are wildcards; everything else is literal (brackets in folder
+    names such as "[2003] Album" do not become character classes).
     """
     try:
         text = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as e:
-        sys.exit(f"Não consegui ler --keep-file {path}: {e}")
+        sys.exit(f"Could not read --keep-file {path}: {e}")
     pats: list[tuple[str, re.Pattern]] = []
     for line in text.splitlines():
         line = line.strip()
@@ -249,7 +249,7 @@ def load_keep_patterns(path: Path) -> list[tuple[str, re.Pattern]]:
 
 
 def keep_match(rel: str, pats: list[tuple[str, re.Pattern]]) -> str | None:
-    """Devolve o padrão que mantém este arquivo (ele mesmo ou uma pasta pai)."""
+    """Returns the pattern that keeps this file (itself or a parent folder)."""
     posix = _norm_path(rel)
     parts = posix.split("/")
     prefixes = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
@@ -271,7 +271,7 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
 
     for dirpath, dirnames, filenames in os.walk(
             src_root, followlinks=False, onerror=walk_errors.append):
-        # Não desce para pastas de lixo nem links simbólicos.
+        # Does not descend into junk folders nor symbolic links.
         keep_dirs: list[str] = []
         for d in dirnames:
             full = Path(dirpath) / d
@@ -295,18 +295,18 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
             ext = src.suffix.lower()
             rel = str(src.relative_to(src_root))
             raw.append((src, rel, ext))
-            # No modo --tiny tudo passa pelo ffmpeg, então só sondamos os .mp4
-            # (podem ser capas animadas / videoclipes sem faixa de áudio).
+            # In --tiny mode everything goes through ffmpeg, so we only probe .mp4
+            # (they can be animated covers / music videos without an audio track).
             if ext in NEEDS_PROBE and (not tiny or ext == ".mp4") and not (
                     keep and keep_match(rel, keep) is not None):
                 to_probe.append(src)
 
-    # ffprobe só é obrigatório se houver arquivos ambíguos.
+    # ffprobe is only mandatory if there are ambiguous files.
     codecs_by_path: dict[Path, str] = {}
     if to_probe:
         if shutil.which("ffprobe") is None:
-            sys.exit("ffprobe é necessário para distinguir lossless de lossy "
-                     "(.m4a/.wma/.ogg/.caf) mas não foi encontrado.")
+            sys.exit("ffprobe is required to tell lossless from lossy "
+                     "(.m4a/.wma/.ogg/.caf) but was not found.")
         workers = max(1, min(jobs_hint or 4, len(to_probe), (os.cpu_count() or 4) * 2))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(probe_codec, p): p for p in to_probe}
@@ -315,7 +315,7 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
                 try:
                     codecs_by_path[p] = fut.result()
                 except Exception as e:  # noqa: BLE001
-                    print(f"AVISO: erro ao detectar codec de {p}: {e}",
+                    print(f"WARNING: error detecting the codec of {p}: {e}",
                           file=sys.stderr, flush=True)
                     codecs_by_path[p] = ""
 
@@ -324,7 +324,7 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
         action = "copy"
         kept = keep_match(rel, keep) if keep else None
         if kept is not None:
-            # Exceção da lista: copiado intacto, sem converter nem reduzir.
+            # Exception list: copied intact, no converting nor downsizing.
             keep_hits[kept] += 1
             skipped["kept"] += 1
             try:
@@ -332,8 +332,8 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
             except OSError:
                 pass
         elif tiny:
-            # .mp4 sem faixa de áudio (ex.: capas animadas do Tidal) não é música:
-            # cai na regra dos "outros arquivos" (copiado, salvo teto --tiny-max-copy).
+            # .mp4 without an audio track (e.g. Tidal animated covers) is not music:
+            # it falls under the "other files" rule (copied, unless above --tiny-max-copy).
             if ext in AUDIO_EXTS and not (
                     ext == ".mp4" and not codecs_by_path.get(src)):
                 action = "ffmpeg"
@@ -354,7 +354,7 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
         elif ext in NEEDS_PROBE:
             codec = codecs_by_path.get(src, "")
             if not codec:
-                print(f"AVISO: sem codec detectado, a copiar como está: {rel}",
+                print(f"WARNING: no codec detected, copying as-is: {rel}",
                       file=sys.stderr, flush=True)
             elif classify_lossless(ext, codec):
                 action = "ffmpeg"
@@ -368,18 +368,18 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
 
     for text, hits in keep_hits.items():
         if hits == 0:
-            print(f"AVISO: --keep-file: o padrão não casou com nada: {text}",
+            print(f"WARNING: --keep-file: the pattern matched nothing: {text}",
                   file=sys.stderr, flush=True)
 
-    # Se dois arquivos colidirem no mesmo destino (ex.: faixa.flac e faixa.opus),
-    # ganha a cópia direta; os restantes são avisados e ignorados.
+    # If two files collide on the same destination (e.g. track.flac and track.opus),
+    # the direct copy wins; the rest is warned about and skipped.
     jobs.sort(key=lambda j: (j.action not in ("copy", "rewrite"), j.rel))
     seen: dict[Path, Job] = {}
     unique: list[Job] = []
     for j in jobs:
         if j.dst in seen:
-            print(f"AVISO: colisão de destino, ignorando {j.rel} "
-                  f"(já existe {seen[j.dst].rel})", file=sys.stderr, flush=True)
+            print(f"WARNING: destination collision, skipping {j.rel} "
+                  f"({seen[j.dst].rel} already exists)", file=sys.stderr, flush=True)
             continue
         seen[j.dst] = j
         unique.append(j)
@@ -390,11 +390,11 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
 
 
 def attach_playlist_maps(jobs: list[Job]) -> None:
-    """Playlists que referenciam arquivos convertidos passam a "rewrite".
+    """Playlists that reference converted files become "rewrite".
 
-    Cada playlist recebe o conjunto de caminhos (relativos à sua pasta, incluindo
-    subpastas como CD1/01.flac) que viram .opus. Se a playlist não referencia
-    nada convertido nessa árvore, continua como cópia simples.
+    Each playlist gets the set of paths (relative to its folder, including
+    subfolders like CD1/01.flac) that become .opus. If the playlist references
+    nothing converted in that tree, it stays a plain copy.
     """
     playlists = [j for j in jobs
                  if j.action == "copy" and j.src.suffix.lower() in PLAYLIST_EXTS]
@@ -425,7 +425,7 @@ _CUE_FILE_BARE = re.compile(r'^(\s*FILE\s+)(\S+)(\s+\S+\s*)$', re.IGNORECASE)
 
 
 def _swap_ext(ref: str, convert_set: set[str]) -> str:
-    """Troca a extensão de ref por .opus se ref aponta para um arquivo convertido."""
+    """Swaps the extension of ref to .opus if ref points at a converted file."""
     norm = ref.replace("\\", "/")
     key = norm[2:] if norm.startswith("./") else norm
     if key in convert_set:
@@ -435,10 +435,10 @@ def _swap_ext(ref: str, convert_set: set[str]) -> str:
 
 
 def rewrite_playlist_text(text: str, convert_set: set[str], is_cue: bool) -> str:
-    """Reescreve referências a arquivos convertidos, linha a linha.
+    """Rewrites references to converted files, line by line.
 
-    Só mexe em referências que casam exatamente com um arquivo convertido
-    (o nome completo, não um pedaço dele), por isso "01.flac" não estraga "101.flac".
+    Only touches references that match a converted file exactly
+    (the whole name, not a fragment of it), so "01.flac" does not break "101.flac".
     """
     out: list[str] = []
     for line in text.splitlines(keepends=True):
@@ -461,7 +461,7 @@ def rewrite_playlist_text(text: str, convert_set: set[str], is_cue: bool) -> str
 
 
 def detect_text_encoding(data: bytes) -> str:
-    """BOM -> codificação do BOM; senão UTF-8 se válido; senão latin-1."""
+    """BOM -> the BOM's encoding; otherwise UTF-8 if valid; otherwise latin-1."""
     if data.startswith(codecs.BOM_UTF8):
         return "utf-8-sig"
     if data[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
@@ -474,11 +474,11 @@ def detect_text_encoding(data: bytes) -> str:
 
 
 def up_to_date(job: Job) -> bool:
-    """O destino foi feito a partir desta versão da origem?
+    """Was the destination made from this version of the source?
 
-    O mtime do destino é copiado da origem, então tem que ser (quase) igual:
-    se a origem for substituída por uma versão mais antiga (restore de backup)
-    também é detectado. Para cópias diretas o tamanho também tem que bater.
+    The destination's mtime is copied from the source, so it must be (almost)
+    equal: if the source is replaced by an older version (backup restore) that
+    is detected too. For direct copies the size must match as well.
     """
     try:
         d = job.dst.stat()
@@ -501,10 +501,10 @@ def is_current(job: Job, args: argparse.Namespace) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Estado (bitrate usado na última execução completa)
+# State (bitrate used on the last complete run)
 # --------------------------------------------------------------------------
 def state_path(dst_root: Path) -> Path:
-    # Fica FORA da pasta de destino para o Navidrome nunca ver este arquivo.
+    # Lives OUTSIDE the destination folder so Navidrome never sees this file.
     return dst_root.parent / f".{dst_root.name}.mirroropus.json"
 
 
@@ -521,7 +521,7 @@ def save_state(dst_root: Path, data: dict) -> None:
         state_path(dst_root).write_text(
             json.dumps(data) + "\n", encoding="utf-8")
     except OSError as e:
-        print(f"AVISO: não consegui gravar o estado do bitrate "
+        print(f"WARNING: could not save the bitrate state "
               f"({state_path(dst_root)}): {e}", file=sys.stderr, flush=True)
 
 
@@ -529,14 +529,14 @@ def save_state(dst_root: Path, data: dict) -> None:
 # Prune
 # --------------------------------------------------------------------------
 def find_orphans(dst_root: Path, expected: set[Path]) -> list[Path]:
-    """Arquivos no destino que não correspondem a nada na origem."""
+    """Files at the destination that match nothing in the source."""
     if not dst_root.is_dir():
         return []
     orphans: list[Path] = []
     for dirpath, _dirnames, filenames in os.walk(dst_root):
         for name in filenames:
             if name.endswith(".part"):
-                continue  # temporários de rodadas interrompidas; limpos à parte
+                continue  # temporaries from interrupted runs; cleaned up separately
             p = Path(dirpath) / name
             if p not in expected:
                 orphans.append(p)
@@ -544,15 +544,15 @@ def find_orphans(dst_root: Path, expected: set[Path]) -> list[Path]:
 
 
 def clean_stale_parts(dst_root: Path, dry_run: bool) -> int:
-    """Apaga *.part de rodadas interrompidas. Retorna quantos encontrou."""
+    """Deletes *.part from interrupted runs. Returns how many were found."""
     if not dst_root.is_dir():
         return 0
     parts = list(dst_root.rglob("*.part"))
     if not parts:
         return 0
     if dry_run:
-        print(f"Encontrados {len(parts)} arquivo(s) temporário(s) *.part "
-              f"(seriam removidos).", flush=True)
+        print(f"Found {len(parts)} temporary *.part file(s) "
+              f"(they would be removed).", flush=True)
         return len(parts)
     n = 0
     for p in parts:
@@ -562,7 +562,7 @@ def clean_stale_parts(dst_root: Path, dry_run: bool) -> int:
         except OSError:
             pass
     if n:
-        print(f"Removidos {n} arquivo(s) temporário(s) *.part de rodada anterior.",
+        print(f"Removed {n} temporary *.part file(s) from a previous run.",
               flush=True)
     return n
 
@@ -574,7 +574,7 @@ def remove_empty_dirs(dst_root: Path) -> int:
         if p == dst_root:
             continue
         try:
-            p.rmdir()  # só funciona se estiver vazia
+            p.rmdir()  # only works if it is empty
             removed += 1
         except OSError:
             pass
@@ -600,7 +600,7 @@ def _run_pipeline(ff_cmd: list[str], enc_cmd: list[str]) -> tuple[bool, str]:
     try:
         ff = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         enc = subprocess.Popen(enc_cmd, stdin=ff.stdout, stderr=subprocess.PIPE)
-        ff.stdout.close()  # o SIGPIPE passa para o ffmpeg se o opusenc sair
+        ff.stdout.close()  # SIGPIPE goes to ffmpeg if opusenc exits first
         _, enc_err = enc.communicate(timeout=3600)
         _, ff_err = ff.communicate(timeout=60)
         ok = ff.returncode == 0 and enc.returncode == 0
@@ -626,7 +626,7 @@ def encode_ffmpeg(src: Path, tmp: Path, bitrate: int) -> tuple[bool, str]:
     cover = ["-map", "0:v:0?", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
     enc_cmd = ["opusenc", "--quiet", "--bitrate", str(bitrate), "-", str(tmp)]
 
-    # 1.ª tentativa com capa embebida; se falhar, 2.ª sem capa
+    # 1st attempt with embedded cover; on failure, 2nd without cover
     ok, msg = _run_pipeline(base + cover + audio, enc_cmd)
     if ok:
         return True, ""
@@ -635,10 +635,11 @@ def encode_ffmpeg(src: Path, tmp: Path, bitrate: int) -> tuple[bool, str]:
 
 
 def encode_tiny(src: Path, tmp: Path, bitrate: int, cover_px: int) -> tuple[bool, str]:
-    """Qualquer áudio -> Opus mono minúsculo, com tags e capa reduzida.
+    """Any audio -> tiny mono Opus, with tags and a downsized cover.
 
-    O ffmpeg decodifica, faz downmix para mono e entrega FLAC em pipe (com tags e
-    a capa já redimensionada) ao opusenc, que grava as tags e a capa no .opus.
+    ffmpeg decodes, downmixes to mono and delivers FLAC on a pipe (with tags and
+    the already resized cover) to opusenc, which writes the tags and the cover
+    into the .opus.
     """
     base = [
         "ffmpeg", "-nostdin", "-v", "error", "-i", str(src),
@@ -646,14 +647,14 @@ def encode_tiny(src: Path, tmp: Path, bitrate: int, cover_px: int) -> tuple[bool
     ]
     audio = ["-ac", "1", "-c:a", "flac", "-compression_level", "0",
              "-f", "flac", "pipe:1"]
-    # framesize 60 ms: menos overhead de cabeçalhos a bitrates tão baixos
+    # 60 ms framesize: less header overhead at such low bitrates
     enc_cmd = ["opusenc", "--quiet", "--bitrate", str(bitrate),
                "--framesize", "60", "-", str(tmp)]
 
     if cover_px > 0:
         cover = [
             "-map", "0:v:0?", "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "12",
-            # só 1 frame: num .mp4 de videoclipe o "vídeo" não é uma capa
+            # only 1 frame: in a music-video .mp4 the "video" is not a cover
             "-frames:v", "1",
             "-vf", f"scale='min({cover_px},iw)':-2",
             "-disposition:v:0", "attached_pic",
@@ -662,13 +663,13 @@ def encode_tiny(src: Path, tmp: Path, bitrate: int, cover_px: int) -> tuple[bool
         if ok:
             return True, ""
         tmp.unlink(missing_ok=True)
-    # sem capa (cover_px == 0, ou a capa deu problema)
+    # no cover (cover_px == 0, or the cover caused trouble)
     ok2, msg2 = _run_pipeline(base + audio, enc_cmd)
     return ok2, msg2 if not ok2 else ""
 
 
 def encode_image(src: Path, tmp: Path, max_px: int) -> tuple[bool, str]:
-    """Imagem -> JPEG pequeno (largura máxima max_px, qualidade baixa)."""
+    """Image -> small JPEG (max width max_px, low quality)."""
     px = max_px if max_px > 0 else 200
     try:
         r = subprocess.run(
@@ -715,12 +716,12 @@ def run_job(job: Job, args: argparse.Namespace) -> tuple[str, str]:
                 ok, err = encoder(job.src, tmp, args.bitrate)
                 if (not ok or not tmp.exists() or tmp.stat().st_size == 0) \
                         and job.action == "opusenc":
-                    # Fallback: WAV/AIFF exóticos que o opusenc não lê
-                    # (ex.: WAV com MP3 dentro) tentam via ffmpeg.
+                    # Fallback: exotic WAV/AIFF that opusenc cannot read
+                    # (e.g. WAV with MP3 inside) try via ffmpeg.
                     tmp.unlink(missing_ok=True)
                     ok, err = encode_ffmpeg(job.src, tmp, args.bitrate)
             if not ok or not tmp.exists() or tmp.stat().st_size == 0:
-                raise RuntimeError(err or "falha desconhecida")
+                raise RuntimeError(err or "unknown failure")
             st = job.src.stat()
             os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         os.replace(tmp, job.dst)
@@ -749,12 +750,12 @@ def size_summary(jobs: list[Job]) -> str | None:
             s = j.src.stat().st_size
             d = j.dst.stat().st_size
         except OSError:
-            continue  # falhou ou ainda não existe: fora da conta, para ser justa
+            continue  # failed or does not exist yet: left out, to be fair
         src_total += s
         dst_total += d
     if not src_total:
         return None
-    return (f"Tamanho: origem {human_size(src_total)} -> destino "
+    return (f"Size: source {human_size(src_total)} -> dest "
             f"{human_size(dst_total)} ({dst_total / src_total * 100:.0f}%).")
 
 
@@ -763,78 +764,78 @@ def size_summary(jobs: list[Job]) -> str | None:
 # --------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Espelha uma biblioteca de música: lossless -> Opus, resto copiado.",
-        epilog="Nota: ao mudar --bitrate, só os arquivos convertidos são refeitos. "
-               "Use --overwrite para refazer absolutamente tudo.",
+        description="Mirrors a music library: lossless -> Opus, everything else copied.",
+        epilog="Note: changing --bitrate only redoes the converted files. "
+               "Use --overwrite to redo absolutely everything.",
     )
-    ap.add_argument("source", type=Path, help="pasta da biblioteca master")
-    ap.add_argument("dest", type=Path, help="pasta de destino")
+    ap.add_argument("source", type=Path, help="master library folder")
+    ap.add_argument("dest", type=Path, help="destination folder")
     ap.add_argument("-b", "--bitrate", type=int, default=None,
-                    help="bitrate Opus em kbps (por padrão: 128; 8 com --tiny)")
+                    help="Opus bitrate in kbps (default: 128; 8 with --tiny)")
     ap.add_argument("--tiny", action="store_true",
-                    help="catálogo mínimo: TODO áudio vira Opus mono de baixíssima "
-                         "qualidade (8 kbps), capas e imagens ficam minúsculas, "
-                         "o resto (7z, logs, ...) é copiado como está")
+                    help="minimal catalogue: ALL audio becomes very low quality "
+                         "mono Opus (8 kbps), covers and images become tiny, "
+                         "everything else (7z, logs, ...) is copied as-is")
     ap.add_argument("--cover-px", type=int, default=200, metavar="N",
-                    help="com --tiny: largura máxima das capas/imagens em pixels "
-                         "(por padrão: 200; 0 remove as capas embutidas)")
+                    help="with --tiny: maximum width of covers/images in pixels "
+                         "(default: 200; 0 strips the embedded covers)")
     ap.add_argument("--tiny-max-copy", type=float, default=None, metavar="MiB",
-                    help="com --tiny: teto opcional, em MiB, para os outros arquivos "
-                         "(7z, pdf, ...): os maiores não são copiados (por padrão: "
-                         "sem teto, tudo é copiado)")
-    ap.add_argument("--keep-file", type=Path, default=None, metavar="ARQUIVO",
-                    help="arquivo de texto com caminhos (relativos à origem) que são "
-                         "copiados intactos, sem converter (raridades em flac, ...)")
+                    help="with --tiny: optional ceiling, in MiB, for other files "
+                         "(7z, pdf, ...): the larger ones are not copied (default: "
+                         "no ceiling, everything is copied)")
+    ap.add_argument("--keep-file", type=Path, default=None, metavar="FILE",
+                    help="text file with paths (relative to the source) that are "
+                         "copied intact, without converting (rare flac releases, ...)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
-                    help="conversões em paralelo (por padrão: nº de CPUs)")
+                    help="parallel conversions (default: number of CPUs)")
     ap.add_argument("--nice", type=int, default=10, metavar="N",
-                    help="prioridade do processo, 0-19 (por padrão: 10; 0 desativa)")
+                    help="process priority, 0-19 (default: 10; 0 disables)")
     ap.add_argument("--overwrite", action="store_true",
-                    help="refazer tudo, mesmo o que já existe no destino")
+                    help="redo everything, even what already exists at the destination")
     ap.add_argument("--dry-run", action="store_true",
-                    help="mostrar o que seria feito, sem escrever nada")
+                    help="show what would be done, without writing anything")
     ap.add_argument("--prune", action="store_true",
-                    help="apagar do destino o que já não existe na origem")
+                    help="delete from the destination what no longer exists in the source")
     ap.add_argument("-y", "--yes", action="store_true",
-                    help="com --prune: permitir apagar mais álbuns do que o limite")
+                    help="with --prune: allow deleting more albums than the limit")
     ap.add_argument("--prune-limit", type=int, default=3, metavar="N",
-                    help="com --prune: máximo de álbuns afetados sem -y (por padrão: 3)")
+                    help="with --prune: maximum number of albums affected without -y (default: 3)")
     args = ap.parse_args()
 
     if args.bitrate is None:
         args.bitrate = 8 if args.tiny else 128
     if not 6 <= args.bitrate <= 512:
-        sys.exit("Bitrate inválido: use 6-512 kbps.")
+        sys.exit("Invalid bitrate: use 6-512 kbps.")
     if args.cover_px < 0:
-        sys.exit("--cover-px tem que ser >= 0.")
+        sys.exit("--cover-px must be >= 0.")
     if args.tiny_max_copy is not None and args.tiny_max_copy < 0:
-        sys.exit("--tiny-max-copy tem que ser >= 0.")
+        sys.exit("--tiny-max-copy must be >= 0.")
     if args.jobs < 1:
-        sys.exit("--jobs tem que ser >= 1.")
+        sys.exit("--jobs must be >= 1.")
     if not 0 <= args.nice <= 19:
-        sys.exit("--nice tem que estar entre 0 e 19.")
+        sys.exit("--nice must be between 0 and 19.")
 
     src_root = args.source.resolve()
     dst_root = args.dest.resolve()
 
     if not src_root.is_dir():
-        sys.exit(f"Origem não é uma pasta: {src_root}")
+        sys.exit(f"Source is not a folder: {src_root}")
     if dst_root == src_root or src_root in dst_root.parents:
-        sys.exit("O destino não pode estar dentro da origem.")
+        sys.exit("The destination cannot be inside the source.")
     if dst_root in src_root.parents:
-        sys.exit("A origem não pode estar dentro do destino.")
+        sys.exit("The source cannot be inside the destination.")
 
     if args.nice and hasattr(os, "nice"):
         try:
-            os.nice(args.nice)  # opusenc/ffmpeg herdam
+            os.nice(args.nice)  # opusenc/ffmpeg inherit it
         except OSError:
             pass
 
     prev_state = load_state(dst_root)
     if prev_state and bool(prev_state.get("tiny", False)) != args.tiny:
         was = "--tiny" if prev_state.get("tiny") else "normal"
-        sys.exit(f"Este destino já foi usado no modo {was} e os dois modos não se "
-                 f"misturam. Use outra pasta de destino.")
+        sys.exit(f"This destination was already used in {was} mode and the two "
+                 f"modes do not mix. Use a different destination folder.")
 
     max_copy = (None if args.tiny_max_copy is None
                 else int(args.tiny_max_copy * 1024 * 1024))
@@ -843,13 +844,13 @@ def main() -> int:
         src_root, dst_root, args.jobs, tiny=args.tiny, max_copy=max_copy, keep=keep)
 
     if any(j.action in CONVERT_ACTIONS for j in jobs) and shutil.which("opusenc") is None:
-        sys.exit("opusenc não encontrado (instala o pacote opus-tools).")
+        sys.exit("opusenc not found (install the opus-tools package).")
     if any(j.action in ("ffmpeg", "image") for j in jobs) and shutil.which("ffmpeg") is None:
-        sys.exit("ffmpeg é necessário (ALAC/APE/WV/TTA/TAK/SHN/DSD/WMA-lossless, "
-                 "modo --tiny, ...) mas não foi encontrado.")
+        sys.exit("ffmpeg is required (ALAC/APE/WV/TTA/TAK/SHN/DSD/WMA-lossless, "
+                 "--tiny mode, ...) but was not found.")
 
-    # Configuração mudou desde a última execução completa? Então refaz só os
-    # arquivos recodificados (as cópias diretas não são tocadas).
+    # Settings changed since the last complete run? Then redo only the
+    # re-encoded files (direct copies are left untouched).
     prev_bitrate = prev_state.get("bitrate")
     prev_cover = prev_state.get("cover_px")
     bitrate_changed = isinstance(prev_bitrate, int) and prev_bitrate != args.bitrate
@@ -860,41 +861,41 @@ def main() -> int:
 
     total = len(jobs)
     n_convert = sum(1 for j in jobs if j.action in RECODE_ACTIONS)
-    print(f"{total} arquivos na origem ({n_convert} a converter). "
+    print(f"{total} files in the source ({n_convert} to convert). "
           f"Bitrate: {args.bitrate} kbps"
-          + (f", mono, capas até {args.cover_px}px. " if args.tiny else ". ")
-          + f"Modo: {'overwrite' if args.overwrite else 'incremental'}"
+          + (f", mono, covers up to {args.cover_px}px. " if args.tiny else ". ")
+          + f"Mode: {'overwrite' if args.overwrite else 'incremental'}"
           + (" + tiny." if args.tiny else "."), flush=True)
     if skipped["junk"] or skipped["symlink"]:
-        print(f"Ignorados: {skipped['junk']} de lixo, "
-              f"{skipped['symlink']} links simbólicos.", flush=True)
+        print(f"Ignored: {skipped['junk']} junk, "
+              f"{skipped['symlink']} symlinks.", flush=True)
     if skipped["big"]:
-        print(f"Ignorados (--tiny): {skipped['big']} arquivo(s) que não são áudio/"
-              f"imagem e passam de {args.tiny_max_copy:g} MiB (não serão copiados).",
+        print(f"Ignored (--tiny): {skipped['big']} file(s) that are not audio/"
+              f"image and are over {args.tiny_max_copy:g} MiB (they will not be copied).",
               flush=True)
     if skipped["kept"]:
-        print(f"Mantidos intactos (--keep-file): {skipped['kept']} arquivo(s), "
+        print(f"Kept intact (--keep-file): {skipped['kept']} file(s), "
               f"{human_size(skipped['kept_bytes'])}.", flush=True)
     if args.redo_converted:
-        print("Configuração mudou (bitrate/capas): "
-              "os arquivos convertidos serão refeitos.", flush=True)
+        print("Settings changed (bitrate/covers): "
+              "the converted files will be redone.", flush=True)
     if walk_errors:
-        print(f"AVISO: {len(walk_errors)} pasta(s) da origem não puderam ser lidas "
-              f"(os arquivos delas NÃO foram espelhados):", file=sys.stderr, flush=True)
+        print(f"WARNING: {len(walk_errors)} source folder(s) could not be read "
+              f"(their files were NOT mirrored):", file=sys.stderr, flush=True)
         for e in walk_errors[:10]:
             print(f"  {e.filename}: {e.strerror or e}", file=sys.stderr)
         if len(walk_errors) > 10:
-            print(f"  ... e mais {len(walk_errors) - 10}", file=sys.stderr)
+            print(f"  ... and {len(walk_errors) - 10} more", file=sys.stderr)
 
-    # ---- Prune: planear e validar ANTES de fazer qualquer coisa ----
+    # ---- Prune: plan and validate BEFORE doing anything ----
     orphans: list[Path] = []
     if args.prune:
         if walk_errors:
-            sys.exit("--prune recusado: algumas pastas da origem não puderam ser lidas "
-                     "e os arquivos delas pareceriam removidos. Nada foi apagado.")
+            sys.exit("--prune refused: some source folders could not be read "
+                     "and their files would look removed. Nothing was deleted.")
         if not any(j.src.suffix.lower() in AUDIO_EXTS for j in jobs):
-            sys.exit("--prune recusado: a origem não tem nenhum arquivo de áudio "
-                     "(disco desmontado ou caminho errado?). Nada foi apagado.")
+            sys.exit("--prune refused: the source has no audio files "
+                     "(unmounted disk or wrong path?). Nothing was deleted.")
 
         expected = {j.dst for j in jobs}
         orphans = find_orphans(dst_root, expected)
@@ -902,29 +903,30 @@ def main() -> int:
         too_many = len(albums) > args.prune_limit
 
         if orphans:
-            print(f"\nAVISO: --prune vai apagar {len(orphans)} arquivo(s) do destino, "
-                  f"afetando {len(albums)} álbum(ns).", file=sys.stderr, flush=True)
+            print(f"\nWARNING: --prune will delete {len(orphans)} file(s) from the "
+                  f"destination, affecting {len(albums)} album(s).", file=sys.stderr, flush=True)
 
             if args.dry_run:
                 for p in orphans:
-                    print(f"[apagar] {p.relative_to(dst_root)}")
+                    print(f"[delete] {p.relative_to(dst_root)}")
                 if too_many and not args.yes:
-                    print(f"(sem -y isso seria recusado: {len(albums)} álbuns > "
-                          f"limite de {args.prune_limit})")
+                    print(f"(without -y this would be refused: {len(albums)} albums > "
+                          f"the limit of {args.prune_limit})")
             elif too_many and not args.yes:
-                print(f"\nRECUSADO: {len(albums)} álbuns seriam afetados, o limite sem -y "
-                      f"é {args.prune_limit}. Nada foi feito (nem conversões nem exclusões).",
+                print(f"\nREFUSED: {len(albums)} album(s) would be affected, the limit "
+                      f"without -y is {args.prune_limit}. Nothing was done (no conversions, "
+                      f"no deletions).",
                       file=sys.stderr, flush=True)
-                print("Álbuns afetados:", file=sys.stderr)
+                print("Affected albums:", file=sys.stderr)
                 for a in albums[:30]:
                     print(f"  {a.relative_to(dst_root)}", file=sys.stderr)
                 if len(albums) > 30:
-                    print(f"  ... e mais {len(albums) - 30}", file=sys.stderr)
-                print("Se for realmente isso que você quer, rode de novo com -y "
-                      "(ou use --dry-run para ver a lista completa).", file=sys.stderr)
+                    print(f"  ... and {len(albums) - 30} more", file=sys.stderr)
+                print("If that is really what you want, run again with -y "
+                      "(or use --dry-run to see the full list).", file=sys.stderr)
                 return 2
         else:
-            print("\n--prune: nada para apagar no destino.", flush=True)
+            print("\n--prune: nothing to delete at the destination.", flush=True)
 
     clean_stale_parts(dst_root, args.dry_run)
 
@@ -936,40 +938,37 @@ def main() -> int:
                 continue
             if j.action in RECODE_ACTIONS:
                 counts["convert"] += 1
-                print(f"[converter] {j.rel}")
+                print(f"[convert] {j.rel}")
             elif j.action == "rewrite":
                 counts["rewrite"] += 1
-                print(f"[reescrever] {j.rel}")
+                print(f"[rewrite] {j.rel}")
             else:
                 counts["copy"] += 1
-                print(f"[copiar] {j.rel}")
-        print(f"\nDry-run: {counts['convert']} a converter, {counts['copy']} a copiar, "
-              f"{counts['rewrite']} playlists a reescrever, "
-              f"{counts['skipped']} já atualizados"
-              + (f", {len(orphans)} a apagar." if args.prune else "."), flush=True)
+                print(f"[copy] {j.rel}")
+        print(f"\nDry-run: {counts['convert']} to convert, {counts['copy']} to copy, "
+              f"{counts['rewrite']} playlist(s) to rewrite, "
+              f"{counts['skipped']} already up to date"
+              + (f", {len(orphans)} to delete." if args.prune else "."), flush=True)
         return 1 if walk_errors else 0
 
     stats = {"skipped": 0, "copied": 0, "rewritten": 0, "converted": 0, "failed": 0}
     failures: list[tuple[str, str]] = []
     done = 0
 
-    # ---- Prune: apagar já (a validação passou) ----
+    # ---- Prune: delete now (validation passed) ----
     pruned = 0
     if orphans:
         for p in orphans:
             try:
                 p.unlink()
                 pruned += 1
-                print(f"[apagar] {p.relative_to(dst_root)}", flush=True)
+                print(f"[delete] {p.relative_to(dst_root)}", flush=True)
             except OSError as e:
-                failures.append((f"(apagar) {p.relative_to(dst_root)}", str(e)))
+                failures.append((f"(delete) {p.relative_to(dst_root)}", str(e)))
         remove_empty_dirs(dst_root)
 
-    STATUS_PT = {"copied": "copiado", "converted": "convertido",
-                 "rewritten": "reescrito", "skipped": "ignorado"}
-
-    # Executor manual (não `with`): num Ctrl-C o `with` esperaria TODOS os jobs
-    # pendentes terminarem, ou seja, a biblioteca inteira.
+    # Manual executor (not `with`): on Ctrl-C a `with` would wait for ALL
+    # pending jobs to finish, i.e. the whole library.
     ex = ThreadPoolExecutor(max_workers=args.jobs)
     interrupted = False
     try:
@@ -984,41 +983,40 @@ def main() -> int:
             done += 1
             if status == "failed":
                 failures.append((job.rel, err))
-                print(f"[{done}/{total}] ERRO: {job.rel}", file=sys.stderr, flush=True)
+                print(f"[{done}/{total}] ERROR: {job.rel}", file=sys.stderr, flush=True)
             elif status != "skipped":
-                print(f"[{done}/{total}] {STATUS_PT.get(status, status)}: {job.rel}",
-                      flush=True)
+                print(f"[{done}/{total}] {status}: {job.rel}", flush=True)
     except KeyboardInterrupt:
         interrupted = True
-        print("\nInterrompido: a cancelar o que ainda não começou...",
+        print("\nInterrupted: cancelling what has not started yet...",
               file=sys.stderr, flush=True)
         ex.shutdown(wait=True, cancel_futures=True)
     else:
         ex.shutdown(wait=True)
 
     if interrupted:
-        print("Você pode rodar de novo para continuar de onde parou.",
+        print("You can run again to continue where you left off.",
               file=sys.stderr, flush=True)
         return 130
 
-    print(f"\nConcluído: {stats['converted']} convertidos, {stats['copied']} copiados, "
-          f"{stats['rewritten']} playlists reescritas, "
-          f"{stats['skipped']} já atualizados, {stats['failed']} com falha"
-          + (f", {pruned} apagados do destino." if args.prune else "."), flush=True)
+    print(f"\nDone: {stats['converted']} converted, {stats['copied']} copied, "
+          f"{stats['rewritten']} playlist(s) rewritten, "
+          f"{stats['skipped']} already up to date, {stats['failed']} failed"
+          + (f", {pruned} deleted from the destination." if args.prune else "."), flush=True)
     summary = size_summary(jobs)
     if summary:
         print(summary, flush=True)
 
-    # Só grava o bitrate novo se nada falhou: um arquivo que falhou continua com o
-    # bitrate antigo e, sem isto, seria considerado atualizado para sempre.
+    # Only save the new bitrate if nothing failed: a file that failed keeps the
+    # old bitrate and, without this, would count as up to date forever.
     if not (settings_changed and failures):
         state = {"bitrate": args.bitrate, "tiny": args.tiny}
         if args.tiny:
             state["cover_px"] = args.cover_px
         save_state(dst_root, state)
     elif failures:
-        print("A nova configuração NÃO foi gravada no estado porque houve falhas; "
-              "a próxima execução refaz os convertidos de novo.",
+        print("The new settings were NOT saved to the state because there were "
+              "failures; the next run will redo the converted files again.",
               file=sys.stderr, flush=True)
 
     if failures:
@@ -1026,7 +1024,7 @@ def main() -> int:
         with log.open("w", encoding="utf-8") as f:
             for rel, err in failures:
                 f.write(f"{rel}\n    {err}\n")
-        print(f"Detalhes dos erros em: {log}", file=sys.stderr, flush=True)
+        print(f"Error details in: {log}", file=sys.stderr, flush=True)
         return 1
     return 1 if walk_errors else 0
 

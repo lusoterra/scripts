@@ -59,9 +59,17 @@ the way of other services on the server (e.g. Navidrome). Use --nice 0 to disabl
     ceiling, use --tiny-max-copy MiB: anything above it stops being copied.
   Use a dedicated destination folder: --tiny mode does not mix with the normal one.
 
-Exception list (--keep-file FILE.txt), applies to both modes:
-  A text file with one path per line, relative to the SOURCE folder. Everything that
-  matches is COPIED INTACT (the original flac, big cover, tags, name and extension)
+--dont-skip-lossy (normal mode): convert EVERYTHING to .opus, including lossy
+sources (mp3, aac, m4a, wma, ogg, mpc, .opus, ...), so even .opus files are
+decoded and re-encoded to .opus. Files with no audio track (.mp4 covers) and
+non-audio files are still copied as-is, and --keep-file exceptions are still
+copied intact.
+
+Exception list (--keep-file FILE.txt), applies to both modes (including plain
+-b/--bitrate runs: the listed rarities stay lossless):
+  A text file with one path per line. A path may be relative to the SOURCE folder,
+  relative to the current directory, or absolute. Everything that matches is
+  COPIED INTACT (the original flac, big cover, tags, name and extension)
   instead of being converted/downsized. Rules:
     - blank lines and lines starting with # are ignored;
     - a folder path keeps everything inside it (subfolders included);
@@ -83,6 +91,8 @@ Usage:
   ./mirroropus.py SOURCE DEST --tiny
   ./mirroropus.py SOURCE DEST --tiny --cover-px 128 --prune
   ./mirroropus.py SOURCE DEST -b 160 -j 8
+  ./mirroropus.py SOURCE DEST --dont-skip-lossy -b 96
+  ./mirroropus.py SOURCE DEST --keep-file rarities.txt -b 128
   ./mirroropus.py SOURCE DEST --overwrite
   ./mirroropus.py SOURCE DEST --dry-run
   ./mirroropus.py SOURCE DEST --prune
@@ -223,11 +233,19 @@ def _norm_path(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 
 
+def _keep_rx(q: str) -> re.Pattern:
+    return re.compile(
+        "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in q)
+        + r"\Z", re.DOTALL)
+
+
 def load_keep_patterns(path: Path) -> list[tuple[str, re.Pattern]]:
     """Reads the --keep-file: (original text, regex) per useful line.
 
-    Only * and ? are wildcards; everything else is literal (brackets in folder
-    names such as "[2003] Album" do not become character classes).
+    A path may be relative to the source folder, relative to the current
+    directory, or absolute. Only * and ? are wildcards; everything else is
+    literal (brackets in folder names such as "[2003] Album" do not become
+    character classes).
     """
     try:
         text = path.read_text(encoding="utf-8-sig")
@@ -241,27 +259,46 @@ def load_keep_patterns(path: Path) -> list[tuple[str, re.Pattern]]:
         q = _norm_path(line).rstrip("/")
         if not q:
             continue
-        rx = re.compile(
-            "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in q)
-            + r"\Z", re.DOTALL)
-        pats.append((line, rx))
+        pats.append((line, _keep_rx(q)))
+        # Absolute paths are also matched in their symlink-resolved form, in
+        # case the pattern was written through a symlink (e.g. /home/... ->
+        # /mnt/...).
+        if q.startswith("/") and "*" not in q and "?" not in q:
+            q2 = _norm_path(os.path.realpath(q)).rstrip("/")
+            if q2 != q:
+                pats.append((line, _keep_rx(q2)))
     return pats
 
 
-def keep_match(rel: str, pats: list[tuple[str, re.Pattern]]) -> str | None:
+def _keep_targets(src: Path, src_root: Path) -> list[str]:
+    """Path variants a pattern may match against (all with their parent-folder
+    prefixes, so a folder pattern keeps everything inside it):
+    relative to the source root, relative to the current directory, absolute."""
+    targets: list[str] = []
+    for base in (src_root, Path.cwd(), None):
+        try:
+            p = src if base is None else src.relative_to(base)
+        except ValueError:
+            continue
+        parts = _norm_path(str(p)).split("/")
+        targets.extend("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    return targets
+
+
+def keep_match(src: Path, src_root: Path,
+               pats: list[tuple[str, re.Pattern]]) -> str | None:
     """Returns the pattern that keeps this file (itself or a parent folder)."""
-    posix = _norm_path(rel)
-    parts = posix.split("/")
-    prefixes = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    targets = _keep_targets(src, src_root)
     for text, rx in pats:
-        if any(rx.match(p) for p in prefixes):
+        if any(rx.match(t) for t in targets):
             return text
     return None
 
 
 def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
                tiny: bool = False, max_copy: int | None = None,
-               keep: list[tuple[str, re.Pattern]] | None = None
+               keep: list[tuple[str, re.Pattern]] | None = None,
+               dont_skip_lossy: bool = False
                ) -> tuple[list[Job], dict[str, int], list[OSError]]:
     raw: list[tuple[Path, str, str]] = []  # (src, rel, ext)
     skipped = {"junk": 0, "symlink": 0, "big": 0, "kept": 0, "kept_bytes": 0}
@@ -298,7 +335,7 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
             # In --tiny mode everything goes through ffmpeg, so we only probe .mp4
             # (they can be animated covers / music videos without an audio track).
             if ext in NEEDS_PROBE and (not tiny or ext == ".mp4") and not (
-                    keep and keep_match(rel, keep) is not None):
+                    keep and keep_match(src, src_root, keep) is not None):
                 to_probe.append(src)
 
     # ffprobe is only mandatory if there are ambiguous files.
@@ -322,7 +359,7 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
     jobs: list[Job] = []
     for src, rel, ext in raw:
         action = "copy"
-        kept = keep_match(rel, keep) if keep else None
+        kept = keep_match(src, src_root, keep) if keep else None
         if kept is not None:
             # Exception list: copied intact, no converting nor downsizing.
             keep_hits[kept] += 1
@@ -353,11 +390,17 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
             action = "ffmpeg"
         elif ext in NEEDS_PROBE:
             codec = codecs_by_path.get(src, "")
-            if not codec:
+            # With --dont-skip-lossy every container with audio is converted,
+            # the only exception being .mp4 without an audio track.
+            if classify_lossless(ext, codec) or (
+                    dont_skip_lossy and not (ext == ".mp4" and not codec)):
+                action = "ffmpeg"
+            elif not codec:
                 print(f"WARNING: no codec detected, copying as-is: {rel}",
                       file=sys.stderr, flush=True)
-            elif classify_lossless(ext, codec):
-                action = "ffmpeg"
+        elif dont_skip_lossy and ext in AUDIO_EXTS:
+            # Lossy sources (mp3, aac, mpc, .opus, ...): decoded and re-encoded.
+            action = "ffmpeg"
 
         dst = dst_root / rel
         if action in CONVERT_ACTIONS:
@@ -776,6 +819,9 @@ def main() -> int:
                     help="minimal catalogue: ALL audio becomes very low quality "
                          "mono Opus (8 kbps), covers and images become tiny, "
                          "everything else (7z, logs, ...) is copied as-is")
+    ap.add_argument("--dont-skip-lossy", action="store_true",
+                    help="convert everything to Opus, including lossy sources "
+                         "(mp3, aac, m4a, wma, ogg, opus, ...), even .opus -> .opus")
     ap.add_argument("--cover-px", type=int, default=200, metavar="N",
                     help="with --tiny: maximum width of covers/images in pixels "
                          "(default: 200; 0 strips the embedded covers)")
@@ -784,8 +830,10 @@ def main() -> int:
                          "(7z, pdf, ...): the larger ones are not copied (default: "
                          "no ceiling, everything is copied)")
     ap.add_argument("--keep-file", type=Path, default=None, metavar="FILE",
-                    help="text file with paths (relative to the source) that are "
-                         "copied intact, without converting (rare flac releases, ...)")
+                    help="text file with paths (relative to the source folder or "
+                         "to the current directory, or absolute) that are "
+                         "copied intact, without converting (rare flac releases, ...); "
+                         "works in --tiny mode and in normal -b/--bitrate runs")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="parallel conversions (default: number of CPUs)")
     ap.add_argument("--nice", type=int, default=10, metavar="N",
@@ -841,7 +889,8 @@ def main() -> int:
                 else int(args.tiny_max_copy * 1024 * 1024))
     keep = load_keep_patterns(args.keep_file) if args.keep_file else None
     jobs, skipped, walk_errors = build_plan(
-        src_root, dst_root, args.jobs, tiny=args.tiny, max_copy=max_copy, keep=keep)
+        src_root, dst_root, args.jobs, tiny=args.tiny, max_copy=max_copy, keep=keep,
+        dont_skip_lossy=args.dont_skip_lossy)
 
     if any(j.action in CONVERT_ACTIONS for j in jobs) and shutil.which("opusenc") is None:
         sys.exit("opusenc not found (install the opus-tools package).")
@@ -865,7 +914,9 @@ def main() -> int:
           f"Bitrate: {args.bitrate} kbps"
           + (f", mono, covers up to {args.cover_px}px. " if args.tiny else ". ")
           + f"Mode: {'overwrite' if args.overwrite else 'incremental'}"
-          + (" + tiny." if args.tiny else "."), flush=True)
+          + (" + tiny" if args.tiny else "")
+          + (" + lossy->opus" if args.dont_skip_lossy else "")
+          + ".", flush=True)
     if skipped["junk"] or skipped["symlink"]:
         print(f"Ignored: {skipped['junk']} junk, "
               f"{skipped['symlink']} symlinks.", flush=True)

@@ -22,9 +22,9 @@ to FLAC on a pipe (with tags and cover), and that pipe is read by opusenc.
 
 Incremental mode (default): only processes what is new or changed in the
 source (different mtime at the destination, or different size on direct copies).
-The bitrate used is kept in a state file inside the destination folder
-(mirroropus.json). If you change -b, only the converted files are
-redone; direct copies are left untouched. --overwrite redoes everything.
+Nothing is remembered between runs: if you change -b or other settings, what is
+already mirrored is NOT redone by itself; use --overwrite to redo the whole
+destination at the new settings.
 
 Always ignored (junk): dotfiles/dot-folders (.DS_Store, ._*, .Trash-1000,
 .Trashes, .Spotlight-V100, ...), @eaDir, .AppleDouble, Thumbs.db, desktop.ini,
@@ -57,7 +57,7 @@ the way of other services on the server (e.g. Navidrome). Use --nice 0 to disabl
   - Any other file (7z/zip of scans, PDFs, .mp4 without audio such as Tidal's
     animated covers, .sfv/.md5, ...) -> copied as-is. If you want a size
     ceiling, use --tiny-max-copy MiB: anything above it stops being copied.
-  Use a dedicated destination folder: --tiny mode does not mix with the normal one.
+  Use a dedicated destination folder: --tiny output must not be mixed with the normal one.
 
 --dont-skip-lossy (normal mode): convert EVERYTHING to .opus, including lossy
 sources (mp3, aac, m4a, wma, ogg, mpc, .opus, ...), so even .opus files are
@@ -109,7 +109,6 @@ from __future__ import annotations
 
 import argparse
 import codecs
-import json
 import os
 import re
 import shutil
@@ -145,10 +144,6 @@ RECODE_ACTIONS = CONVERT_ACTIONS + ("image",)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 
 TIMESTAMP_TOLERANCE = 2.0  # seconds (filesystems with coarse mtime)
-
-# Bumped when the encoder output changes: converted files of an older mirror are
-# redone once (v2 repairs the --tiny outputs whose audio was cut to ~1 second).
-ENC_VERSION = 2
 
 # Extensions considered "music" (to count albums and validate the source).
 # Includes lossy + lossless + ambiguous containers.
@@ -565,54 +560,35 @@ def up_to_date(job: Job) -> bool:
 def is_current(job: Job, args: argparse.Namespace) -> bool:
     if args.overwrite:
         return False
-    if args.redo_converted and job.action in RECODE_ACTIONS:
-        return False
     return up_to_date(job)
 
 
 # --------------------------------------------------------------------------
-# State (bitrate used on the last complete run)
+# Cleanup of the state files written by older versions (the settings used on
+# the last run are no longer remembered: use --overwrite to redo a destination
+# at new settings).
 # --------------------------------------------------------------------------
-STATE_NAME = "mirroropus.json"
-
-
-def state_path(dst_root: Path) -> Path:
-    return dst_root / STATE_NAME
-
-
-def legacy_state_path(dst_root: Path) -> Path:
-    # Old location: hidden file next to the destination folder.
-    return dst_root.parent / f".{dst_root.name}.mirroropus.json"
-
-
-def load_state(dst_root: Path) -> dict:
-    for path in (state_path(dst_root), legacy_state_path(dst_root)):
+def cleanup_state_files(dst_root: Path, dry_run: bool) -> int:
+    """Removes leftover state files of older versions. Returns how many."""
+    old = [dst_root / "mirroropus.json",
+           dst_root.parent / f".{dst_root.name}.mirroropus.json"]
+    found = [p for p in old if p.is_file()]
+    if not found:
+        return 0
+    if dry_run:
+        print(f"Found {len(found)} state file(s) of older versions "
+              f"(they would be removed).", flush=True)
+        return len(found)
+    n = 0
+    for p in found:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        if path != state_path(dst_root):
-            # Old location: move it inside the destination.
-            if save_state(dst_root, data):
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-        return data
-    return {}
-
-
-def save_state(dst_root: Path, data: dict) -> bool:
-    try:
-        state_path(dst_root).write_text(
-            json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        return True
-    except OSError as e:
-        print(f"WARNING: could not save the bitrate state "
-              f"({state_path(dst_root)}): {e}", file=sys.stderr, flush=True)
-        return False
+            p.unlink()
+            n += 1
+        except OSError:
+            pass
+    if n:
+        print(f"Removed {n} state file(s) of older versions.", flush=True)
+    return n
 
 
 # --------------------------------------------------------------------------
@@ -622,15 +598,12 @@ def find_orphans(dst_root: Path, expected: set[Path]) -> list[Path]:
     """Files at the destination that match nothing in the source."""
     if not dst_root.is_dir():
         return []
-    state = state_path(dst_root)
     orphans: list[Path] = []
     for dirpath, _dirnames, filenames in os.walk(dst_root):
         for name in filenames:
             if name.endswith(".part"):
                 continue  # temporaries from interrupted runs; cleaned up separately
             p = Path(dirpath) / name
-            if p == state:
-                continue  # mirroropus state, kept even though it has no source match
             if p not in expected:
                 orphans.append(p)
     return sorted(orphans)
@@ -860,8 +833,8 @@ def size_summary(jobs: list[Job]) -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Mirrors a music library: lossless -> Opus, everything else copied.",
-        epilog="Note: changing --bitrate only redoes the converted files. "
-               "Use --overwrite to redo absolutely everything.",
+        epilog="Note: changing --bitrate does not affect what is already in the "
+               "destination. Use --overwrite to redo everything at the new settings.",
     )
     ap.add_argument("source", type=Path, help="master library folder")
     ap.add_argument("dest", type=Path, help="destination folder")
@@ -935,12 +908,6 @@ def main() -> int:
         except OSError:
             pass
 
-    prev_state = load_state(dst_root)
-    if prev_state and bool(prev_state.get("tiny", False)) != args.tiny:
-        was = "--tiny" if prev_state.get("tiny") else "normal"
-        sys.exit(f"This destination was already used in {was} mode and the two "
-                 f"modes do not mix. Use a different destination folder.")
-
     max_copy = (None if args.tiny_max_copy is None
                 else int(args.tiny_max_copy * 1024 * 1024))
     keep = load_keep_patterns(args.keep_album) if args.keep_album else None
@@ -953,20 +920,6 @@ def main() -> int:
     if any(j.action in ("ffmpeg", "image") for j in jobs) and shutil.which("ffmpeg") is None:
         sys.exit("ffmpeg is required (ALAC/APE/WV/TTA/TAK/SHN/DSD/WMA-lossless, "
                  "--tiny mode, ...) but was not found.")
-
-    # Settings changed since the last complete run? Then redo only the
-    # re-encoded files (direct copies are left untouched).
-    prev_bitrate = prev_state.get("bitrate")
-    prev_cover = prev_state.get("cover_px")
-    bitrate_changed = isinstance(prev_bitrate, int) and prev_bitrate != args.bitrate
-    cover_changed = (args.tiny and isinstance(prev_cover, int)
-                     and prev_cover != args.cover_px)
-    # Older encoder output (e.g. the --tiny files whose audio was cut short when
-    # a cover was embedded): redone once, like a settings change.
-    enc_changed = (bool(prev_state) and args.tiny
-                   and prev_state.get("enc_version", 1) < ENC_VERSION)
-    settings_changed = bitrate_changed or cover_changed or enc_changed
-    args.redo_converted = settings_changed and not args.overwrite
 
     total = len(jobs)
     n_convert = sum(1 for j in jobs if j.action in RECODE_ACTIONS)
@@ -987,12 +940,6 @@ def main() -> int:
     if skipped["kept"]:
         print(f"Kept intact (--keep-album): {skipped['kept']} file(s), "
               f"{human_size(skipped['kept_bytes'])}.", flush=True)
-    if args.redo_converted:
-        why = [w for w, changed in (("bitrate", bitrate_changed),
-                                    ("covers", cover_changed),
-                                    ("encoder fix", enc_changed)) if changed]
-        print(f"Settings changed ({'/'.join(why)}): "
-              "the converted files will be redone.", flush=True)
     if walk_errors:
         print(f"WARNING: {len(walk_errors)} source folder(s) could not be read "
               f"(their files were NOT mirrored):", file=sys.stderr, flush=True)
@@ -1043,6 +990,7 @@ def main() -> int:
             print("\n--prune: nothing to delete at the destination.", flush=True)
 
     clean_stale_parts(dst_root, args.dry_run)
+    cleanup_state_files(dst_root, args.dry_run)
 
     if args.dry_run:
         counts = {"skipped": 0, "copy": 0, "convert": 0, "rewrite": 0}
@@ -1120,19 +1068,6 @@ def main() -> int:
     summary = size_summary(jobs)
     if summary:
         print(summary, flush=True)
-
-    # Only save the new bitrate if nothing failed: a file that failed keeps the
-    # old bitrate and, without this, would count as up to date forever.
-    if not (settings_changed and failures):
-        state = {"bitrate": args.bitrate, "tiny": args.tiny,
-                 "enc_version": ENC_VERSION}
-        if args.tiny:
-            state["cover_px"] = args.cover_px
-        save_state(dst_root, state)
-    elif failures:
-        print("The new settings were NOT saved to the state because there were "
-              "failures; the next run will redo the converted files again.",
-              file=sys.stderr, flush=True)
 
     if failures:
         log = Path.cwd() / "mirroropus_errors.log"

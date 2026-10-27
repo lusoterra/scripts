@@ -62,37 +62,42 @@ the way of other services on the server (e.g. Navidrome). Use --nice 0 to disabl
 --dont-skip-lossy (normal mode): convert EVERYTHING to .opus, including lossy
 sources (mp3, aac, m4a, wma, ogg, mpc, .opus, ...), so even .opus files are
 decoded and re-encoded to .opus. Files with no audio track (.mp4 covers) and
-non-audio files are still copied as-is, and --keep-file exceptions are still
+non-audio files are still copied as-is, and --keep-album exceptions are still
 copied intact.
 
-Exception list (--keep-file FILE.txt), applies to both modes (including plain
--b/--bitrate runs: the listed rarities stay lossless):
-  A text file with one path per line. A path may be relative to the SOURCE folder,
-  relative to the current directory, or absolute. Everything that matches is
-  COPIED INTACT (the original flac, big cover, tags, name and extension)
-  instead of being converted/downsized. Rules:
-    - blank lines and lines starting with # are ignored;
-    - a folder path keeps everything inside it (subfolders included);
-    - a file path keeps only that file;
-    - * matches anything (including slashes) and ? matches a single character; everything
-      else is literal, so [brackets] and (parentheses) in names work as-is;
-    - case matters; "/" or "\\" are equivalent.
-  Example:
-      # rarities
-      Artist/[2003] Demo Tape
-      Artist/Rare Single/01 - Rare Track.flac
-      *Live at Some Radio Session*
-  Patterns that match nothing produce a warning (typo).
-  Playlists (.cue/.m3u) keep pointing at the .flac of kept files.
+Kept albums (--keep-album ALBUM), applies to both modes (including plain
+-b/--bitrate runs: the listed rarities stay lossless). Repeat the flag for each
+album; a value is either:
+  - an album folder name, matched anywhere in the tree ("Demo Tape [2003]" keeps
+    that album whoever the artist is);
+  - a path: relative to the SOURCE folder, relative to the current directory,
+    or absolute ("/mnt/music/Artist/Album");
+  - a .txt file with one of the above per line, for long lists.
+Everything inside a kept album is COPIED INTACT (the original flac, big cover,
+tags, name and extension) instead of being converted/downsized. Rules:
+  - blank lines and lines starting with # are ignored in .txt lists;
+  - a folder (by name or by path) keeps everything inside it (subfolders included);
+  - a file path keeps only that file;
+  - * matches anything (including slashes) and ? matches a single character; everything
+    else is literal, so [brackets] and (parentheses) in names work as-is;
+  - case matters; "/" or "\\" are equivalent.
+Example (rarities.txt):
+    # rarities
+    Demo Tape [2003]
+    Artist/Rare Single
+    *Live at Some Radio Session*
+Patterns that match nothing produce a warning (typo).
+Playlists (.cue/.m3u) keep pointing at the .flac of kept files.
 
 Usage:
   ./mirroropus.py SOURCE DEST
-  ./mirroropus.py SOURCE DEST --tiny --keep-file rarities.txt
+  ./mirroropus.py SOURCE DEST --tiny --keep-album rarities.txt
   ./mirroropus.py SOURCE DEST --tiny
   ./mirroropus.py SOURCE DEST --tiny --cover-px 128 --prune
   ./mirroropus.py SOURCE DEST -b 160 -j 8
   ./mirroropus.py SOURCE DEST --dont-skip-lossy -b 96
-  ./mirroropus.py SOURCE DEST --keep-file rarities.txt -b 128
+  ./mirroropus.py SOURCE DEST --keep-album "Demo Tape [2003]" -b 128
+  ./mirroropus.py SOURCE DEST --keep-album rarities.txt --keep-album "/mnt/music/Artist/Album"
   ./mirroropus.py SOURCE DEST --overwrite
   ./mirroropus.py SOURCE DEST --dry-run
   ./mirroropus.py SOURCE DEST --prune
@@ -239,20 +244,32 @@ def _keep_rx(q: str) -> re.Pattern:
         + r"\Z", re.DOTALL)
 
 
-def load_keep_patterns(path: Path) -> list[tuple[str, re.Pattern]]:
-    """Reads the --keep-file: (original text, regex) per useful line.
+def load_keep_patterns(values: list[str]) -> list[tuple[str, re.Pattern]]:
+    """Builds the keep patterns from the --keep-album values.
 
-    A path may be relative to the source folder, relative to the current
+    Each value is an album name or path, or a .txt file with one per line. A
+    bare name matches any folder/file with that name anywhere in the tree; a
+    path may be relative to the source folder, relative to the current
     directory, or absolute. Only * and ? are wildcards; everything else is
     literal (brackets in folder names such as "[2003] Album" do not become
     character classes).
     """
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError) as e:
-        sys.exit(f"Could not read --keep-file {path}: {e}")
+    entries: list[str] = []
+    for v in values:
+        p = Path(v).expanduser()
+        is_list = "*" not in v and "?" not in v and p.suffix.lower() == ".txt"
+        if not is_list:
+            entries.append(v)
+            continue
+        if not p.is_file():
+            sys.exit(f"--keep-album: no such list file: {v}")
+        try:
+            entries.extend(p.read_text(encoding="utf-8-sig").splitlines())
+        except (OSError, UnicodeDecodeError) as e:
+            sys.exit(f"Could not read --keep-album list file {p}: {e}")
+
     pats: list[tuple[str, re.Pattern]] = []
-    for line in text.splitlines():
+    for line in entries:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -271,10 +288,16 @@ def load_keep_patterns(path: Path) -> list[tuple[str, re.Pattern]]:
 
 
 def _keep_targets(src: Path, src_root: Path) -> list[str]:
-    """Path variants a pattern may match against (all with their parent-folder
-    prefixes, so a folder pattern keeps everything inside it):
-    relative to the source root, relative to the current directory, absolute."""
+    """What a keep pattern may match against:
+    - the single path components of the library-relative path, so a bare name
+      (an album folder name) matches at any depth;
+    - cumulative path prefixes (relative to the source root, relative to the
+      current directory, absolute), so a folder path keeps everything inside it."""
     targets: list[str] = []
+    try:
+        targets.extend(_norm_path(str(src.relative_to(src_root))).split("/"))
+    except ValueError:
+        pass
     for base in (src_root, Path.cwd(), None):
         try:
             p = src if base is None else src.relative_to(base)
@@ -411,7 +434,7 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
 
     for text, hits in keep_hits.items():
         if hits == 0:
-            print(f"WARNING: --keep-file: the pattern matched nothing: {text}",
+            print(f"WARNING: --keep-album: matched nothing: {text}",
                   file=sys.stderr, flush=True)
 
     # If two files collide on the same destination (e.g. track.flac and track.opus),
@@ -829,11 +852,15 @@ def main() -> int:
                     help="with --tiny: optional ceiling, in MiB, for other files "
                          "(7z, pdf, ...): the larger ones are not copied (default: "
                          "no ceiling, everything is copied)")
-    ap.add_argument("--keep-file", type=Path, default=None, metavar="FILE",
-                    help="text file with paths (relative to the source folder or "
-                         "to the current directory, or absolute) that are "
-                         "copied intact, without converting (rare flac releases, ...); "
-                         "works in --tiny mode and in normal -b/--bitrate runs")
+    ap.add_argument("--keep-album", "--keep-file", dest="keep_album",
+                    action="append", default=None, metavar="ALBUM",
+                    help="album(s) to keep intact (rare flac releases, ...), not "
+                         "converted: repeat the flag per album; each value is an "
+                         "album folder name (matched anywhere in the tree), a path "
+                         "(relative to the source folder or to the current "
+                         "directory, or absolute), or a .txt file with one per "
+                         "line; works in --tiny mode and in normal -b/--bitrate "
+                         "runs (--keep-file is an old alias)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="parallel conversions (default: number of CPUs)")
     ap.add_argument("--nice", type=int, default=10, metavar="N",
@@ -887,7 +914,7 @@ def main() -> int:
 
     max_copy = (None if args.tiny_max_copy is None
                 else int(args.tiny_max_copy * 1024 * 1024))
-    keep = load_keep_patterns(args.keep_file) if args.keep_file else None
+    keep = load_keep_patterns(args.keep_album) if args.keep_album else None
     jobs, skipped, walk_errors = build_plan(
         src_root, dst_root, args.jobs, tiny=args.tiny, max_copy=max_copy, keep=keep,
         dont_skip_lossy=args.dont_skip_lossy)
@@ -925,7 +952,7 @@ def main() -> int:
               f"image and are over {args.tiny_max_copy:g} MiB (they will not be copied).",
               flush=True)
     if skipped["kept"]:
-        print(f"Kept intact (--keep-file): {skipped['kept']} file(s), "
+        print(f"Kept intact (--keep-album): {skipped['kept']} file(s), "
               f"{human_size(skipped['kept_bytes'])}.", flush=True)
     if args.redo_converted:
         print("Settings changed (bitrate/covers): "

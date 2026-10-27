@@ -22,8 +22,8 @@ to FLAC on a pipe (with tags and cover), and that pipe is read by opusenc.
 
 Incremental mode (default): only processes what is new or changed in the
 source (different mtime at the destination, or different size on direct copies).
-The bitrate used is kept in a state file next to the destination folder
-(.NAME.mirroropus.json). If you change -b, only the converted files are
+The bitrate used is kept in a state file inside the destination folder
+(mirroropus.json). If you change -b, only the converted files are
 redone; direct copies are left untouched. --overwrite redoes everything.
 
 Always ignored (junk): dotfiles/dot-folders (.DS_Store, ._*, .Trash-1000,
@@ -573,26 +573,46 @@ def is_current(job: Job, args: argparse.Namespace) -> bool:
 # --------------------------------------------------------------------------
 # State (bitrate used on the last complete run)
 # --------------------------------------------------------------------------
+STATE_NAME = "mirroropus.json"
+
+
 def state_path(dst_root: Path) -> Path:
-    # Lives OUTSIDE the destination folder so Navidrome never sees this file.
+    return dst_root / STATE_NAME
+
+
+def legacy_state_path(dst_root: Path) -> Path:
+    # Old location: hidden file next to the destination folder.
     return dst_root.parent / f".{dst_root.name}.mirroropus.json"
 
 
 def load_state(dst_root: Path) -> dict:
-    try:
-        data = json.loads(state_path(dst_root).read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    for path in (state_path(dst_root), legacy_state_path(dst_root)):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if path != state_path(dst_root):
+            # Old location: move it inside the destination.
+            if save_state(dst_root, data):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        return data
+    return {}
 
 
-def save_state(dst_root: Path, data: dict) -> None:
+def save_state(dst_root: Path, data: dict) -> bool:
     try:
         state_path(dst_root).write_text(
-            json.dumps(data) + "\n", encoding="utf-8")
+            json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        return True
     except OSError as e:
         print(f"WARNING: could not save the bitrate state "
               f"({state_path(dst_root)}): {e}", file=sys.stderr, flush=True)
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -602,12 +622,15 @@ def find_orphans(dst_root: Path, expected: set[Path]) -> list[Path]:
     """Files at the destination that match nothing in the source."""
     if not dst_root.is_dir():
         return []
+    state = state_path(dst_root)
     orphans: list[Path] = []
     for dirpath, _dirnames, filenames in os.walk(dst_root):
         for name in filenames:
             if name.endswith(".part"):
                 continue  # temporaries from interrupted runs; cleaned up separately
             p = Path(dirpath) / name
+            if p == state:
+                continue  # mirroropus state, kept even though it has no source match
             if p not in expected:
                 orphans.append(p)
     return sorted(orphans)

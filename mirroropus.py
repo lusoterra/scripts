@@ -852,7 +852,7 @@ def main() -> int:
                     help="with --tiny: optional ceiling, in MiB, for other files "
                          "(7z, pdf, ...): the larger ones are not copied (default: "
                          "no ceiling, everything is copied)")
-    ap.add_argument("--keep-album", "--keep-file", dest="keep_album",
+    ap.add_argument("--keep-album", dest="keep_album",
                     action="append", default=None, metavar="ALBUM",
                     help="album(s) to keep intact (rare flac releases, ...), not "
                          "converted: repeat the flag per album; each value is an "
@@ -860,7 +860,7 @@ def main() -> int:
                          "(relative to the source folder or to the current "
                          "directory, or absolute), or a .txt file with one per "
                          "line; works in --tiny mode and in normal -b/--bitrate "
-                         "runs (--keep-file is an old alias)")
+                         "runs")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="parallel conversions (default: number of CPUs)")
     ap.add_argument("--nice", type=int, default=10, metavar="N",

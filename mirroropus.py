@@ -2,28 +2,36 @@
 """
 mirroropus.py
 
-Mirrors a music library (master) to a lightweight Opus copy,
-keeping the folder structure.
+Mirrors a music library (master) to a lightweight copy, keeping the
+folder structure. The target codec is chosen with --codec (default: opus).
 
   - Lossy (MP3, Opus, Ogg Vorbis, AAC, WMA lossy, Musepack, ...) -> copied as-is
   - Lossless (FLAC, WAV, AIFF, ALAC, APE, WV, TTA, TAK, SHN, WMA lossless,
-    Ogg-FLAC, DSD (.dsf/.dff), CAF/AIFC lossless, ...)           -> converted to .opus
+    Ogg-FLAC, DSD (.dsf/.dff), CAF/AIFC lossless, ...)           -> converted to the
+    target codec (.opus by default, .mp3 with --codec mp3, .m4a with --codec aac)
   - Playlists (.cue, .m3u, .m3u8)                                -> copied and rewritten
-    to point at the .opus files (e.g. FILE "track.flac" becomes FILE "track.opus"),
-    keeping the original encoding and line endings
+    to point at the converted files (e.g. FILE "track.flac" becomes FILE
+    "track.opus", or "track.mp3"/"track.m4a" with --codec), keeping the
+    original encoding and line endings
   - Everything else                                              -> copied as-is:
     accurip (.accurip), .log, .nfo, .txt, .lrc, covers (.jpg/.png),
     scans and booklets (e.g. [album]/scans/, .7z/.zip/.rar/.pdf with scans),
     and any other file or subfolder. The structure is kept identical to the source.
 
-Encoder: opusenc (opus-tools). Copies tags and embedded covers from FLAC.
-Formats opusenc cannot read go first through ffmpeg, which decodes
-to FLAC on a pipe (with tags and cover), and that pipe is read by opusenc.
+Encoders (--codec):
+  opus -> opusenc (opus-tools), default "--bitrate 128"
+  mp3  -> lame, default "-V 0"
+  aac  -> qaac (wine on Linux), default "-V 91" (AAC-LC); there is NO fallback
+          encoder for aac: if qaac is missing or broken the run stops with an
+          error, because the other aac encoders are not worth using.
+Tags and embedded covers are kept for every codec (opusenc does it directly,
+mp3/aac get a fast ffmpeg tag pass after encoding).
+--lossy-opts replaces the codec's default options (see below).
 
 Incremental mode (default): only processes what is new or changed in the
 source (different mtime at the destination, or different size on direct copies).
-Nothing is remembered between runs: if you change -b or other settings, what is
-already mirrored is NOT redone by itself; use --overwrite to redo the whole
+Nothing is remembered between runs: if you change --codec or --lossy-opts, what
+is already mirrored is NOT redone by itself; use --overwrite to redo the whole
 destination at the new settings.
 
 Always ignored (junk): dotfiles/dot-folders (.DS_Store, ._*, .Trash-1000,
@@ -58,15 +66,17 @@ the way of other services on the server (e.g. Navidrome). Use --nice 0 to disabl
     animated covers, .sfv/.md5, ...) -> copied as-is. If you want a size
     ceiling, use --tiny-max-copy MiB: anything above it stops being copied.
   Use a dedicated destination folder: --tiny output must not be mixed with the normal one.
+  --tiny only works with --codec opus (its 8 kbps mono output is the point of the
+  mode): with --codec mp3 or --codec aac it is ignored (a note is printed).
 
---dont-skip-lossy (normal mode): convert EVERYTHING to .opus, including lossy
-sources (mp3, aac, m4a, wma, ogg, mpc, .opus, ...), so even .opus files are
-decoded and re-encoded to .opus. Files with no audio track (.mp4 covers) and
+--dont-skip-lossy (normal mode): convert EVERYTHING to the target codec,
+including lossy sources (mp3, aac, m4a, wma, ogg, mpc, .opus, ...), so even
+.opus files are decoded and re-encoded. Files with no audio track (.mp4 covers) and
 non-audio files are still copied as-is, and --keep-album exceptions are still
 copied intact.
 
 Kept albums (--keep-album ALBUM), applies to both modes (including plain
--b/--bitrate runs: the listed rarities stay lossless). Repeat the flag for each
+--codec runs: the listed rarities stay lossless). Repeat the flag for each
 album; a value is either:
   - an album folder name, matched anywhere in the tree ("Demo Tape [2003]" keeps
     that album whoever the artist is);
@@ -94,9 +104,12 @@ Usage:
   ./mirroropus.py SOURCE DEST --tiny --keep-album rarities.txt
   ./mirroropus.py SOURCE DEST --tiny
   ./mirroropus.py SOURCE DEST --tiny --cover-px 128 --prune
-  ./mirroropus.py SOURCE DEST -b 160 -j 8
-  ./mirroropus.py SOURCE DEST --dont-skip-lossy -b 96
-  ./mirroropus.py SOURCE DEST --keep-album "Demo Tape [2003]" -b 128
+  ./mirroropus.py SOURCE DEST --lossy-opts="--bitrate 160" -j 8
+  ./mirroropus.py SOURCE DEST --codec mp3
+  ./mirroropus.py SOURCE DEST --codec mp3 --lossy-opts="-V 2"
+  ./mirroropus.py SOURCE DEST --codec aac
+  ./mirroropus.py SOURCE DEST --dont-skip-lossy --lossy-opts="--bitrate 96"
+  ./mirroropus.py SOURCE DEST --keep-album "Demo Tape [2003]"
   ./mirroropus.py SOURCE DEST --keep-album rarities.txt --keep-album "/mnt/music/Artist/Album"
   ./mirroropus.py SOURCE DEST --overwrite
   ./mirroropus.py SOURCE DEST --dry-run
@@ -111,10 +124,13 @@ import argparse
 import codecs
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import unicodedata
+import wave
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -136,9 +152,17 @@ NEEDS_PROBE = {".m4a", ".mp4", ".wma", ".ogg", ".oga", ".caf", ".aifc"}
 # Playlists with references to audio files (rewritten at the destination)
 PLAYLIST_EXTS = {".cue", ".m3u", ".m3u8"}
 
-CONVERT_ACTIONS = ("opusenc", "ffmpeg")
+CONVERT_ACTIONS = ("direct", "pipe")
 # Everything that is re-encoded (audio + images in --tiny mode)
 RECODE_ACTIONS = CONVERT_ACTIONS + ("image",)
+
+# Target codecs: extension and the options given to the encoder when the user
+# does not pass --lossy-opts (which REPLACES these defaults).
+CODEC_EXT = {"opus": ".opus", "mp3": ".mp3", "aac": ".m4a"}
+CODEC_DEFAULT_OPTS = {"opus": "--bitrate 128", "mp3": "-V 0", "aac": "-V 91"}
+
+# --tiny is always this, whatever --lossy-opts says
+TINY_BITRATE = 8
 
 # Images that --tiny mode downsizes to a small JPEG.
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
@@ -185,10 +209,12 @@ def _is_junk_file(name: str) -> bool:
 class Job:
     src: Path
     dst: Path
-    action: str  # "copy" | "opusenc" | "ffmpeg" | "rewrite" | "image"
+    # "copy" | "direct" (encoder reads the source file itself) |
+    # "pipe" (ffmpeg decodes to a pipe first) | "rewrite" | "image"
+    action: str
     rel: str
     # Playlists only: paths (relative to the playlist's folder, with "/")
-    # of the files that become .opus at the destination.
+    # of the files that get converted at the destination.
     convert_set: set[str] | None = None
 
 
@@ -320,7 +346,7 @@ def keep_match(src: Path, src_root: Path,
 def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
                tiny: bool = False, max_copy: int | None = None,
                keep: list[tuple[str, re.Pattern]] | None = None,
-               dont_skip_lossy: bool = False
+               dont_skip_lossy: bool = False, codec: str = "opus"
                ) -> tuple[list[Job], dict[str, int], list[OSError]]:
     raw: list[tuple[Path, str, str]] = []  # (src, rel, ext)
     skipped = {"junk": 0, "symlink": 0, "big": 0, "kept": 0, "kept_bytes": 0}
@@ -395,7 +421,7 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
             # it falls under the "other files" rule (copied, unless above --tiny-max-copy).
             if ext in AUDIO_EXTS and not (
                     ext == ".mp4" and not codecs_by_path.get(src)):
-                action = "ffmpeg"
+                action = "pipe"
             elif ext in IMAGE_EXTS:
                 action = "image"
             elif max_copy is not None and ext not in PLAYLIST_EXTS:
@@ -407,26 +433,28 @@ def build_plan(src_root: Path, dst_root: Path, jobs_hint: int,
                     skipped["big"] += 1
                     continue
         elif ext in OPUSENC_NATIVE:
-            action = "opusenc"
+            # Only opusenc reads those directly; lame/qaac always get a
+            # WAV decoded by ffmpeg.
+            action = "direct" if codec == "opus" else "pipe"
         elif ext in VIA_FFMPEG:
-            action = "ffmpeg"
+            action = "pipe"
         elif ext in NEEDS_PROBE:
-            codec = codecs_by_path.get(src, "")
+            src_codec = codecs_by_path.get(src, "")
             # With --dont-skip-lossy every container with audio is converted,
             # the only exception being .mp4 without an audio track.
-            if classify_lossless(ext, codec) or (
-                    dont_skip_lossy and not (ext == ".mp4" and not codec)):
-                action = "ffmpeg"
-            elif not codec:
+            if classify_lossless(ext, src_codec) or (
+                    dont_skip_lossy and not (ext == ".mp4" and not src_codec)):
+                action = "pipe"
+            elif not src_codec:
                 print(f"WARNING: no codec detected, copying as-is: {rel}",
                       file=sys.stderr, flush=True)
         elif dont_skip_lossy and ext in AUDIO_EXTS:
             # Lossy sources (mp3, aac, mpc, .opus, ...): decoded and re-encoded.
-            action = "ffmpeg"
+            action = "pipe"
 
         dst = dst_root / rel
         if action in CONVERT_ACTIONS:
-            dst = dst.with_suffix(".opus")
+            dst = dst.with_suffix(CODEC_EXT[codec])
         elif action == "image":
             dst = dst.with_suffix(".jpg")
         jobs.append(Job(src, dst, action, rel))
@@ -458,8 +486,8 @@ def attach_playlist_maps(jobs: list[Job]) -> None:
     """Playlists that reference converted files become "rewrite".
 
     Each playlist gets the set of paths (relative to its folder, including
-    subfolders like CD1/01.flac) that become .opus. If the playlist references
-    nothing converted in that tree, it stays a plain copy.
+    subfolders like CD1/01.flac) that get converted at the destination. If the
+    playlist references nothing converted in that tree, it stays a plain copy.
     """
     playlists = [j for j in jobs
                  if j.action == "copy" and j.src.suffix.lower() in PLAYLIST_EXTS]
@@ -489,17 +517,18 @@ _CUE_FILE_QUOTED = re.compile(r'^(\s*FILE\s+")([^"]*)(".*)$', re.IGNORECASE)
 _CUE_FILE_BARE = re.compile(r'^(\s*FILE\s+)(\S+)(\s+\S+\s*)$', re.IGNORECASE)
 
 
-def _swap_ext(ref: str, convert_set: set[str]) -> str:
-    """Swaps the extension of ref to .opus if ref points at a converted file."""
+def _swap_ext(ref: str, convert_set: set[str], ext: str) -> str:
+    """Swaps the extension of ref to ext (.opus/.mp3/.m4a) if it points at a converted file."""
     norm = ref.replace("\\", "/")
     key = norm[2:] if norm.startswith("./") else norm
     if key in convert_set:
         base, _dot, _ext = ref.rpartition(".")
-        return base + ".opus"
+        return base + ext
     return ref
 
 
-def rewrite_playlist_text(text: str, convert_set: set[str], is_cue: bool) -> str:
+def rewrite_playlist_text(text: str, convert_set: set[str], is_cue: bool,
+                          ext: str = ".opus") -> str:
     """Rewrites references to converted files, line by line.
 
     Only touches references that match a converted file exactly
@@ -512,15 +541,15 @@ def rewrite_playlist_text(text: str, convert_set: set[str], is_cue: bool) -> str
         if is_cue:
             m = _CUE_FILE_QUOTED.match(body)
             if m:
-                body = m.group(1) + _swap_ext(m.group(2), convert_set) + m.group(3)
+                body = m.group(1) + _swap_ext(m.group(2), convert_set, ext) + m.group(3)
             else:
                 m = _CUE_FILE_BARE.match(body)
                 if m:
-                    body = m.group(1) + _swap_ext(m.group(2), convert_set) + m.group(3)
+                    body = m.group(1) + _swap_ext(m.group(2), convert_set, ext) + m.group(3)
         elif body.strip() and not body.lstrip().startswith("#"):
             lead = body[:len(body) - len(body.lstrip())]
             tail = body[len(body.rstrip()):]
-            body = lead + _swap_ext(body.strip(), convert_set) + tail
+            body = lead + _swap_ext(body.strip(), convert_set, ext) + tail
         out.append(body + eol)
     return "".join(out)
 
@@ -650,10 +679,10 @@ def remove_empty_dirs(dst_root: Path) -> int:
 # --------------------------------------------------------------------------
 # Encoding
 # --------------------------------------------------------------------------
-def encode_opusenc(src: Path, tmp: Path, bitrate: int) -> tuple[bool, str]:
+def encode_opusenc(src: Path, tmp: Path, opts: list[str]) -> tuple[bool, str]:
     try:
         r = subprocess.run(
-            ["opusenc", "--quiet", "--bitrate", str(bitrate), str(src), str(tmp)],
+            ["opusenc", "--quiet", *opts, str(src), str(tmp)],
             capture_output=True, text=True, timeout=3600,
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -683,14 +712,14 @@ def _run_pipeline(ff_cmd: list[str], enc_cmd: list[str]) -> tuple[bool, str]:
                     pass
 
 
-def encode_ffmpeg(src: Path, tmp: Path, bitrate: int) -> tuple[bool, str]:
+def encode_ffmpeg(src: Path, tmp: Path, opts: list[str]) -> tuple[bool, str]:
     base = [
         "ffmpeg", "-nostdin", "-v", "error", "-i", str(src),
         "-map", "0:a:0", "-map_metadata", "0",
     ]
     audio = ["-c:a", "flac", "-compression_level", "0", "-f", "flac", "pipe:1"]
     cover = ["-map", "0:v:0?", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
-    enc_cmd = ["opusenc", "--quiet", "--bitrate", str(bitrate), "-", str(tmp)]
+    enc_cmd = ["opusenc", "--quiet", *opts, "-", str(tmp)]
 
     # 1st attempt with embedded cover; on failure, 2nd without cover
     ok, msg = _run_pipeline(base + cover + audio, enc_cmd)
@@ -698,6 +727,108 @@ def encode_ffmpeg(src: Path, tmp: Path, bitrate: int) -> tuple[bool, str]:
         return True, ""
     ok2, msg2 = _run_pipeline(base + audio, enc_cmd)
     return ok2, msg2 if not ok2 else ""
+
+
+def _encode_lossy(src: Path, tmp: Path, opts: list[str], codec: str) -> tuple[bool, str]:
+    """Any source -> WAV on a pipe -> lame/qaac, then tags and cover.
+
+    lame/qaac read no tags (and no cover), so after the audio is encoded a fast
+    ffmpeg pass (stream copy, no re-encode) writes the tags and the embedded
+    cover from the source into the result.
+    """
+    base = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(src), "-map", "0:a:0"]
+    wav = ["-c:a", "pcm_s16le", "-f", "wav", "pipe:1"]
+    if codec == "mp3":
+        enc_cmd = ["lame", "--silent", *opts, "-", str(tmp)]
+    else:
+        enc_cmd = ["qaac", "--ignorelength", *opts, "-o", str(tmp), "-"]
+
+    # 1st attempt with the source sample rate: lame and the CoreAudio encoder
+    # only do up to 48 kHz, so 88.2/96/192 kHz sources fail and are redone
+    # with a resample to 48 kHz.
+    ok, msg = _run_pipeline(base + wav, enc_cmd)
+    if not ok:
+        tmp.unlink(missing_ok=True)
+        ok, msg = _run_pipeline(base + ["-ar", "48000"] + wav, enc_cmd)
+        if not ok:
+            tmp.unlink(missing_ok=True)
+            return False, msg
+    tag_err = inject_tags(src, tmp, codec)
+    if tag_err:
+        print(f"WARNING: could not write tags/cover into {tmp.name}: {tag_err}",
+              file=sys.stderr, flush=True)
+    return True, ""
+
+
+def inject_tags(src: Path, raw: Path, codec: str) -> str:
+    """Copies tags + embedded cover from the source into the encoded file.
+
+    Fast ffmpeg pass (audio stream copy, no re-encode). Returns "" on success,
+    otherwise the error message: the audio is kept, tags/cover are then missing.
+    """
+    out = raw.with_name(raw.stem + ".tagging.part")
+    msg = ""
+    for with_cover in (True, False):
+        cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y",
+               "-i", str(src), "-i", str(raw),
+               "-map", "1:a:0", "-map_metadata", "0", "-c:a", "copy"]
+        if with_cover:
+            cmd += ["-map", "0:v:0?", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
+        if codec == "mp3":
+            cmd += ["-id3v2_version", "3"]
+        cmd += ["-f", "mp3" if codec == "mp3" else "mp4", str(out)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.SubprocessError) as e:
+            out.unlink(missing_ok=True)
+            return str(e)
+        msg = r.stderr.strip()
+        if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            os.replace(out, raw)
+            return ""
+        # failure: the cover is usually the problem (e.g. a real video track),
+        # retry once with tags only before giving up on them.
+        out.unlink(missing_ok=True)
+    return msg
+
+
+def encode_audio(src: Path, tmp: Path, opts: list[str], codec: str,
+                 direct: bool = False) -> tuple[bool, str]:
+    """Encodes one file to the target codec. Only used outside --tiny mode."""
+    if codec == "opus":
+        if direct:
+            ok, err = encode_opusenc(src, tmp, opts)
+            if ok and tmp.exists() and tmp.stat().st_size > 0:
+                return True, ""
+            # Fallback: exotic WAV/AIFF that opusenc cannot read
+            # (e.g. WAV with MP3 inside) try via ffmpeg.
+            tmp.unlink(missing_ok=True)
+            return encode_ffmpeg(src, tmp, opts)
+        return encode_ffmpeg(src, tmp, opts)
+    return _encode_lossy(src, tmp, opts, codec)
+
+
+def probe_encoder(args: argparse.Namespace) -> None:
+    """Fails before mirroring anything if the encoder cannot encode at all.
+
+    Catches a broken install (qaac present but wine unusable), or --lossy-opts
+    the encoder rejects, instead of failing on every single file later.
+    """
+    with tempfile.TemporaryDirectory(prefix="mirroropus-probe-") as td:
+        wav = Path(td) / "probe.wav"
+        with wave.open(str(wav), "wb") as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(44100)
+            f.writeframes(b"\x00\x00" * 4410)  # 0.1 s of silence
+        out = Path(td) / f"probe{CODEC_EXT[args.codec]}"
+        ok, err = encode_audio(wav, out, args.encoder_opts, args.codec,
+                               direct=(args.codec == "opus"))
+        if not ok or not out.exists() or out.stat().st_size == 0:
+            sys.exit(f"The {args.codec} encoder failed on a test encode "
+                     f"(options: {' '.join(args.encoder_opts) or 'encoder defaults'}):\n"
+                     f"  {err or 'no error output'}\n"
+                     f"Nothing was mirrored.")
 
 
 def encode_tiny(src: Path, tmp: Path, bitrate: int, cover_px: int) -> tuple[bool, str]:
@@ -770,7 +901,8 @@ def run_job(job: Job, args: argparse.Namespace) -> tuple[str, str]:
             enc = detect_text_encoding(data)
             text = data.decode(enc)
             out = rewrite_playlist_text(
-                text, job.convert_set or set(), job.src.suffix.lower() == ".cue")
+                text, job.convert_set or set(), job.src.suffix.lower() == ".cue",
+                CODEC_EXT[args.codec])
             tmp.write_bytes(out.encode(enc))
             st = job.src.stat()
             os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -778,16 +910,10 @@ def run_job(job: Job, args: argparse.Namespace) -> tuple[str, str]:
             if job.action == "image":
                 ok, err = encode_image(job.src, tmp, args.cover_px)
             elif args.tiny:
-                ok, err = encode_tiny(job.src, tmp, args.bitrate, args.cover_px)
+                ok, err = encode_tiny(job.src, tmp, TINY_BITRATE, args.cover_px)
             else:
-                encoder = encode_opusenc if job.action == "opusenc" else encode_ffmpeg
-                ok, err = encoder(job.src, tmp, args.bitrate)
-                if (not ok or not tmp.exists() or tmp.stat().st_size == 0) \
-                        and job.action == "opusenc":
-                    # Fallback: exotic WAV/AIFF that opusenc cannot read
-                    # (e.g. WAV with MP3 inside) try via ffmpeg.
-                    tmp.unlink(missing_ok=True)
-                    ok, err = encode_ffmpeg(job.src, tmp, args.bitrate)
+                ok, err = encode_audio(job.src, tmp, args.encoder_opts,
+                                       args.codec, direct=(job.action == "direct"))
             if not ok or not tmp.exists() or tmp.stat().st_size == 0:
                 raise RuntimeError(err or "unknown failure")
             st = job.src.stat()
@@ -832,21 +958,32 @@ def size_summary(jobs: list[Job]) -> str | None:
 # --------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Mirrors a music library: lossless -> Opus, everything else copied.",
-        epilog="Note: changing --bitrate does not affect what is already in the "
-               "destination. Use --overwrite to redo everything at the new settings.",
+        description="Mirrors a music library: lossless -> Opus/mp3/aac (--codec), "
+                    "everything else copied.",
+        epilog="Note: changing --codec or --lossy-opts does not affect what is "
+               "already in the destination. Use --overwrite to redo everything at "
+               "the new settings.",
     )
     ap.add_argument("source", type=Path, help="master library folder")
     ap.add_argument("dest", type=Path, help="destination folder")
-    ap.add_argument("-b", "--bitrate", type=int, default=None,
-                    help="Opus bitrate in kbps (default: 128; 8 with --tiny)")
+    ap.add_argument("--codec", choices=("opus", "mp3", "aac"), default="opus",
+                    help="target codec for converted files (default: opus -> .opus; "
+                         "mp3 -> .mp3 via lame; aac -> .m4a via qaac, no fallback "
+                         "encoder for aac)")
+    ap.add_argument("--lossy-opts", default=None, metavar="OPTS",
+                    help=f"options for the encoder, REPLACING the codec's defaults "
+                         f"(opus: '{CODEC_DEFAULT_OPTS['opus']}', "
+                         f"mp3: '{CODEC_DEFAULT_OPTS['mp3']}', "
+                         f"aac: '{CODEC_DEFAULT_OPTS['aac']}'); example: "
+                         f"--lossy-opts='-V 2' with --codec mp3")
     ap.add_argument("--tiny", action="store_true",
                     help="minimal catalogue: ALL audio becomes very low quality "
                          "mono Opus (8 kbps), covers and images become tiny, "
                          "everything else (7z, logs, ...) is copied as-is")
     ap.add_argument("--dont-skip-lossy", action="store_true",
-                    help="convert everything to Opus, including lossy sources "
-                         "(mp3, aac, m4a, wma, ogg, opus, ...), even .opus -> .opus")
+                    help="convert everything to the target codec, including lossy "
+                         "sources (mp3, aac, m4a, wma, ogg, opus, ...), "
+                         "even .opus -> .opus")
     ap.add_argument("--cover-px", type=int, default=200, metavar="N",
                     help="with --tiny: maximum width of covers/images in pixels "
                          "(default: 200; 0 strips the embedded covers)")
@@ -861,8 +998,7 @@ def main() -> int:
                          "album folder name (matched anywhere in the tree), a path "
                          "(relative to the source folder or to the current "
                          "directory, or absolute), or a .txt file with one per "
-                         "line; works in --tiny mode and in normal -b/--bitrate "
-                         "runs")
+                         "line; works in --tiny mode and in normal --codec runs")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="parallel conversions (default: number of CPUs)")
     ap.add_argument("--nice", type=int, default=10, metavar="N",
@@ -879,10 +1015,21 @@ def main() -> int:
                     help="with --prune: maximum number of albums affected without -y (default: 3)")
     args = ap.parse_args()
 
-    if args.bitrate is None:
-        args.bitrate = 8 if args.tiny else 128
-    if not 6 <= args.bitrate <= 512:
-        sys.exit("Invalid bitrate: use 6-512 kbps.")
+    if args.tiny and args.codec != "opus":
+        print(f"Note: --tiny ignored (--codec {args.codec} is not opus); "
+              "mirroring normally.", flush=True)
+        args.tiny = False
+    elif args.tiny and args.lossy_opts is not None:
+        print("Note: --lossy-opts ignored with --tiny "
+              f"(fixed {TINY_BITRATE} kbps mono Opus).", flush=True)
+        args.lossy_opts = None
+    if args.lossy_opts is None:
+        args.encoder_opts = shlex.split(CODEC_DEFAULT_OPTS[args.codec])
+    else:
+        try:
+            args.encoder_opts = shlex.split(args.lossy_opts)
+        except ValueError as e:
+            sys.exit(f"--lossy-opts: {e}")
     if args.cover_px < 0:
         sys.exit("--cover-px must be >= 0.")
     if args.tiny_max_copy is not None and args.tiny_max_copy < 0:
@@ -913,22 +1060,48 @@ def main() -> int:
     keep = load_keep_patterns(args.keep_album) if args.keep_album else None
     jobs, skipped, walk_errors = build_plan(
         src_root, dst_root, args.jobs, tiny=args.tiny, max_copy=max_copy, keep=keep,
-        dont_skip_lossy=args.dont_skip_lossy)
+        dont_skip_lossy=args.dont_skip_lossy, codec=args.codec)
 
-    if any(j.action in CONVERT_ACTIONS for j in jobs) and shutil.which("opusenc") is None:
-        sys.exit("opusenc not found (install the opus-tools package).")
-    if any(j.action in ("ffmpeg", "image") for j in jobs) and shutil.which("ffmpeg") is None:
-        sys.exit("ffmpeg is required (ALAC/APE/WV/TTA/TAK/SHN/DSD/WMA-lossless, "
-                 "--tiny mode, ...) but was not found.")
+    has_convert = any(j.action in CONVERT_ACTIONS for j in jobs)
+    if has_convert:
+        if args.codec == "opus" and shutil.which("opusenc") is None:
+            sys.exit("opusenc not found (install the opus-tools package).")
+        elif args.codec == "mp3" and shutil.which("lame") is None:
+            sys.exit("lame not found: it is required for --codec mp3.")
+        elif args.codec == "aac":
+            # No fallback encoder for aac: everything except qaac sounds bad.
+            try:
+                r = subprocess.run(["qaac", "--check"], capture_output=True,
+                                   text=True, timeout=300)
+            except (OSError, subprocess.SubprocessError) as e:
+                sys.exit(f"qaac could not be run ({e}).\n--codec aac uses qaac "
+                         "only (wine on Linux), there is no fallback encoder. "
+                         "Nothing was mirrored.")
+            if r.returncode != 0:
+                sys.exit("qaac --check failed:\n"
+                         + ((r.stdout or "") + (r.stderr or "")).strip()
+                         + "\n--codec aac uses qaac only, there is no fallback "
+                         "encoder. Nothing was mirrored.")
+        if any(j.action in ("pipe", "image") for j in jobs) \
+                and shutil.which("ffmpeg") is None:
+            if args.codec == "opus":
+                sys.exit("ffmpeg is required (ALAC/APE/WV/TTA/TAK/SHN/DSD/"
+                         "WMA-lossless, --tiny mode, ...) but was not found.")
+            sys.exit(f"ffmpeg is required for --codec {args.codec} (it decodes "
+                     "every source before the encoder) but was not found.")
+        # Last check: encode something for real, once, so a broken encoder or
+        # rejected --lossy-opts stop the run before any file is written.
+        probe_encoder(args)
 
     total = len(jobs)
     n_convert = sum(1 for j in jobs if j.action in RECODE_ACTIONS)
     print(f"{total} files in the source ({n_convert} to convert). "
-          f"Bitrate: {args.bitrate} kbps"
-          + (f", mono, covers up to {args.cover_px}px. " if args.tiny else ". ")
+          + (f"Bitrate: {TINY_BITRATE} kbps, mono, covers up to {args.cover_px}px. "
+             if args.tiny else
+             f"Codec: {args.codec} ({' '.join(args.encoder_opts) or 'encoder defaults'}). ")
           + f"Mode: {'overwrite' if args.overwrite else 'incremental'}"
           + (" + tiny" if args.tiny else "")
-          + (" + lossy->opus" if args.dont_skip_lossy else "")
+          + (f" + lossy->{args.codec}" if args.dont_skip_lossy else "")
           + ".", flush=True)
     if skipped["junk"] or skipped["symlink"]:
         print(f"Ignored: {skipped['junk']} junk, "

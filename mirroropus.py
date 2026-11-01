@@ -128,9 +128,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import unicodedata
-import wave
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -808,29 +806,6 @@ def encode_audio(src: Path, tmp: Path, opts: list[str], codec: str,
     return _encode_lossy(src, tmp, opts, codec)
 
 
-def probe_encoder(args: argparse.Namespace) -> None:
-    """Fails before mirroring anything if the encoder cannot encode at all.
-
-    Catches a broken install (qaac present but wine unusable), or --lossy-opts
-    the encoder rejects, instead of failing on every single file later.
-    """
-    with tempfile.TemporaryDirectory(prefix="mirroropus-probe-") as td:
-        wav = Path(td) / "probe.wav"
-        with wave.open(str(wav), "wb") as f:
-            f.setnchannels(1)
-            f.setsampwidth(2)
-            f.setframerate(44100)
-            f.writeframes(b"\x00\x00" * 4410)  # 0.1 s of silence
-        out = Path(td) / f"probe{CODEC_EXT[args.codec]}"
-        ok, err = encode_audio(wav, out, args.encoder_opts, args.codec,
-                               direct=(args.codec == "opus"))
-        if not ok or not out.exists() or out.stat().st_size == 0:
-            sys.exit(f"The {args.codec} encoder failed on a test encode "
-                     f"(options: {' '.join(args.encoder_opts) or 'encoder defaults'}):\n"
-                     f"  {err or 'no error output'}\n"
-                     f"Nothing was mirrored.")
-
-
 def encode_tiny(src: Path, tmp: Path, bitrate: int, cover_px: int) -> tuple[bool, str]:
     """Any audio -> tiny mono Opus, with tags and a downsized cover.
 
@@ -951,6 +926,50 @@ def size_summary(jobs: list[Job]) -> str | None:
         return None
     return (f"Size: source {human_size(src_total)} -> dest "
             f"{human_size(dst_total)} ({dst_total / src_total * 100:.0f}%).")
+
+
+# --------------------------------------------------------------------------
+# Progress bar
+# --------------------------------------------------------------------------
+BAR_WIDTH = 24
+
+
+def progress_line(done: int, total: int, stats: dict[str, int],
+                  current: str, width: int) -> str:
+    """One line for the bottom progress bar: bar, percent, counts, current file.
+
+    Built to fit the terminal: the counts are dropped/truncated first and the
+    file name last, so nothing essential is cut in the middle.
+    """
+    total = max(total, 1)
+    filled = round(BAR_WIDTH * done / total)
+    line = (f"[{'#' * filled}{'-' * (BAR_WIDTH - filled)}] "
+            f"{100 * done // total}% {done}/{total}")
+    room = width - len(line)
+    counts = ", ".join(
+        f"{stats[k]} {k}"
+        for k in ("converted", "copied", "rewritten", "skipped", "failed")
+        if stats.get(k))
+    if counts:
+        seg = f" | {counts}"
+        if len(seg) <= room:
+            line += seg
+        elif room > 12:
+            line += seg[:room - 3] + "..."
+        room = width - len(line)
+    if current and room > 12:
+        avail = room - 3
+        name = current if len(current) <= avail else "..." + current[-(avail - 3):]
+        line += f" | {name}"
+    return line[:width]
+
+
+def draw_progress(line: str) -> None:
+    print("\r\x1b[K" + line, end="", flush=True)
+
+
+def clear_progress() -> None:
+    print("\r\x1b[K", end="", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -1089,9 +1108,6 @@ def main() -> int:
                          "WMA-lossless, --tiny mode, ...) but was not found.")
             sys.exit(f"ffmpeg is required for --codec {args.codec} (it decodes "
                      "every source before the encoder) but was not found.")
-        # Last check: encode something for real, once, so a broken encoder or
-        # rejected --lossy-opts stop the run before any file is written.
-        probe_encoder(args)
 
     total = len(jobs)
     n_convert = sum(1 for j in jobs if j.action in RECODE_ACTIONS)
@@ -1189,6 +1205,10 @@ def main() -> int:
     stats = {"skipped": 0, "copied": 0, "rewritten": 0, "converted": 0, "failed": 0}
     failures: list[tuple[str, str]] = []
     done = 0
+    # On a terminal: one progress line at the bottom, updated in place.
+    # Piped/redirected: the plain [n/total] lines, so logs stay readable.
+    tty = sys.stdout.isatty()
+    bar_width = max(shutil.get_terminal_size((100, 24)).columns - 1, 40)
 
     # ---- Prune: delete now (validation passed) ----
     pruned = 0
@@ -1218,9 +1238,15 @@ def main() -> int:
             done += 1
             if status == "failed":
                 failures.append((job.rel, err))
-                print(f"[{done}/{total}] ERROR: {job.rel}", file=sys.stderr, flush=True)
-            elif status != "skipped":
+                if tty:
+                    clear_progress()  # so the error line is not drawn over
+                print((f"ERROR: {job.rel}" if tty else
+                       f"[{done}/{total}] ERROR: {job.rel}"),
+                      file=sys.stderr, flush=True)
+            elif status != "skipped" and not tty:
                 print(f"[{done}/{total}] {status}: {job.rel}", flush=True)
+            if tty:
+                draw_progress(progress_line(done, total, stats, job.rel, bar_width))
     except KeyboardInterrupt:
         interrupted = True
         print("\nInterrupted: cancelling what has not started yet...",
@@ -1228,6 +1254,11 @@ def main() -> int:
         ex.shutdown(wait=True, cancel_futures=True)
     else:
         ex.shutdown(wait=True)
+
+    # Final state of the bar (100%), left on screen above the summary.
+    if tty and total and not interrupted:
+        draw_progress(progress_line(done, total, stats, "", bar_width))
+        print(flush=True)
 
     if interrupted:
         print("You can run again to continue where you left off.",

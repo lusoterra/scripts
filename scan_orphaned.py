@@ -364,16 +364,17 @@ def _scan_dotfiles(compute_sizes: bool) -> list[DirEntry]:
     return entries
 
 
-def scan_all(compute_sizes: bool, extra_roots: list[Path]) -> list[DirEntry]:
+def scan_all(compute_sizes: bool, extra_roots: list[Path], include_cache: bool = False) -> list[DirEntry]:
     entries: list[DirEntry] = []
     # Map root -> category
     roots = [
         (CONFIG_HOME, "config"),
         (DATA_HOME, "data"),
-        (CACHE_HOME, "cache"),
         (STATE_HOME, "state"),
         (VAR_APP_HOME, "varapp"),
     ]
+    if include_cache:
+        roots.insert(2, (CACHE_HOME, "cache"))
     for root, cat in roots:
         entries.extend(_scan_root(root, cat, compute_sizes))
     entries.extend(_scan_dotfiles(compute_sizes))
@@ -469,6 +470,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Only show entries at least this big (e.g. 100M, 1G).")
     parser.add_argument("--extra", type=str, default=None,
                         help="Comma-separated extra directories to scan.")
+    parser.add_argument("--include-cache", action="store_true",
+                        help="Also scan the cache directory (skipped by default).")
     args = parser.parse_args(argv)
 
     compute_sizes = not args.no_sizes
@@ -497,15 +500,17 @@ def main(argv: list[str] | None = None) -> int:
         print("  WARNING: no pacman packages found (pacman missing or DB unavailable). "
               "Results will over-report orphans.", file=sys.stderr)
     print("Scanning roots:", file=sys.stderr)
-    for label, root in [("config", CONFIG_HOME), ("data", DATA_HOME),
-                        ("cache", CACHE_HOME), ("state", STATE_HOME),
-                        ("var/app", VAR_APP_HOME)]:
+    root_list = [("config", CONFIG_HOME), ("data", DATA_HOME),
+                 ("state", STATE_HOME), ("var/app", VAR_APP_HOME)]
+    if args.include_cache:
+        root_list.insert(2, ("cache", CACHE_HOME))
+    for label, root in root_list:
         print(f"  {label}: {root} {'(exists)' if root.is_dir() else '(missing)'}", file=sys.stderr)
     if extra_roots:
         for r in extra_roots:
             print(f"  extra: {r}", file=sys.stderr)
 
-    entries = scan_all(compute_sizes, extra_roots)
+    entries = scan_all(compute_sizes, extra_roots, args.include_cache)
     results = classify(entries, packages, flatpaks, desktop_map, whitelist)
 
     # min-size filter
